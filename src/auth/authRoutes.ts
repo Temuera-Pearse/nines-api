@@ -1,31 +1,28 @@
-import { Router } from 'express'
-import {
-  type AuthenticatedRequest,
-  requireAuth0Jwt,
-} from './auth0Jwt.js'
+import { Router, type RequestHandler } from 'express'
+import type { GetCurrentPlayerService } from '../players/application/GetCurrentPlayerService.js'
+import { currentPlayerPayload } from '../routes/v1/meRoutes.js'
+import type { AuthenticatedRequest } from './auth0Jwt.js'
 
-export function createAuthRoutes() {
+/** Deprecated compatibility route for the existing frontend. Never use roles from this response for authorization. */
+export function createAuthRoutes(
+  requireIdentity: RequestHandler,
+  getCurrentPlayer: GetCurrentPlayerService,
+): Router {
   const router = Router()
-
-  router.get('/me', requireAuth0Jwt(), (req: AuthenticatedRequest, res) => {
-    if (!req.player) {
-      return res.status(401).json({
-        error: 'invalid_token',
-        message: 'Bearer token is invalid',
-      })
-    }
-
-    const { userId, authProvider, email, displayName, roles } = req.player
-    return res.json({
-      userId,
-      authProvider,
-      email,
-      displayName,
-      roles,
-    })
+  router.get('/me', requireIdentity, (request: AuthenticatedRequest, response, next) => {
+    response.setHeader('Deprecation', 'true')
+    response.setHeader('Link', '</v1/me>; rel="successor-version"')
+    void currentPlayerPayload(request, getCurrentPlayer)
+      .then((player) =>
+        response.status(200).json({
+          userId: player.playerId,
+          authProvider: 'auth0',
+          email: player.email ?? undefined,
+          displayName: player.displayName ?? player.playerId,
+          roles: ['player'],
+        }),
+      )
+      .catch(next)
   })
-
   return router
 }
-
-export default createAuthRoutes()
