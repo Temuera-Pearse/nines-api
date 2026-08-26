@@ -35,6 +35,7 @@ export interface KycProfileRepository {
   ): Promise<KycProfile | null>
   findExpiredVerified(
     at: Date,
+    limit: number,
     executor: QueryExecutor,
   ): Promise<KycProfile[]>
 }

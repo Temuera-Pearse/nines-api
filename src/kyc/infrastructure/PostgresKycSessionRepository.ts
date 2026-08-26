@@ -181,6 +181,24 @@ export class PostgresKycSessionRepository implements KycSessionRepository {
     return result.rows[0] ? mapSession(result.rows[0]) : null
   }
 
+  async expireIfDue(
+    sessionId: string,
+    at: Date,
+    executor: QueryExecutor,
+  ): Promise<KycSession | null> {
+    const result = await executor.query<KycSessionRow>(
+      `UPDATE kyc_verification_sessions
+       SET status = 'expired', completed_at = $2, updated_at = NOW()
+       WHERE id = $1
+         AND status IN ('pending', 'manual_review')
+         AND expires_at IS NOT NULL
+         AND expires_at <= $2
+       RETURNING ${SESSION_COLUMNS}`,
+      [sessionId, at],
+    )
+    return result.rows[0] ? mapSession(result.rows[0]) : null
+  }
+
   async findByProviderReferenceForUpdate(
     provider: string,
     providerSessionReference: string,
@@ -203,7 +221,7 @@ export class PostgresKycSessionRepository implements KycSessionRepository {
     const result = await executor.query<KycSessionRow>(
       `UPDATE kyc_verification_sessions
        SET status = $2,
-           last_event_at = $3,
+           last_event_at = GREATEST(COALESCE(last_event_at, $3), $3),
            completed_at = $4,
            updated_at = NOW()
        WHERE id = $1
@@ -215,6 +233,7 @@ export class PostgresKycSessionRepository implements KycSessionRepository {
 
   async findExpiredPending(
     at: Date,
+    limit: number,
     executor: QueryExecutor,
   ): Promise<KycSession[]> {
     const result = await executor.query<KycSessionRow>(
@@ -224,8 +243,9 @@ export class PostgresKycSessionRepository implements KycSessionRepository {
          AND expires_at IS NOT NULL
          AND expires_at <= $1
        ORDER BY expires_at, id
+       LIMIT $2
        FOR UPDATE SKIP LOCKED`,
-      [at],
+      [at, limit],
     )
     return result.rows.map(mapSession)
   }

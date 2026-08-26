@@ -4,6 +4,13 @@ import type { AppConfig } from './config/config.js'
 import { createAuth0JwtVerifier, requireAuth0Identity, type VerifyBearerToken } from './auth/auth0Jwt.js'
 import { createAuthRoutes } from './auth/authRoutes.js'
 import { PostgresAuditRepository } from './audit/PostgresAuditRepository.js'
+import { CreateCryptoFundingIntentService, type CryptoAssetPolicy } from './crypto/application/CreateCryptoFundingIntentService.js'
+import { GetCryptoFundingIntentService } from './crypto/application/GetCryptoFundingIntentService.js'
+import { ProcessCryptoProviderEventService } from './crypto/application/ProcessCryptoProviderEventService.js'
+import { TransitionCryptoFundingService } from './crypto/application/TransitionCryptoFundingService.js'
+import { PostgresCryptoFundingRepository } from './crypto/infrastructure/PostgresCryptoFundingRepository.js'
+import { FakeCryptoFundingProvider } from './crypto/providers/FakeCryptoFundingProvider.js'
+import type { CryptoFundingProvider } from './crypto/providers/CryptoFundingProvider.js'
 import { EvaluateEligibilityService } from './eligibility/application/EvaluateEligibilityService.js'
 import { PostgresEligibilityDecisionRepository } from './eligibility/infrastructure/PostgresEligibilityDecisionRepository.js'
 import { PostgresRestrictionRepository } from './eligibility/infrastructure/PostgresRestrictionRepository.js'
@@ -11,6 +18,8 @@ import { GetKycProfileService } from './kyc/application/GetKycProfileService.js'
 import { MockHostedKycService } from './kyc/application/MockHostedKycService.js'
 import { ProcessKycProviderEventService } from './kyc/application/ProcessKycProviderEventService.js'
 import { StartKycVerificationService } from './kyc/application/StartKycVerificationService.js'
+import { TransitionKycStatusService } from './kyc/application/TransitionKycStatusService.js'
+import { PostgresKycManualReviewRepository } from './kyc/infrastructure/PostgresKycManualReviewRepository.js'
 import { PostgresKycProfileRepository } from './kyc/infrastructure/PostgresKycProfileRepository.js'
 import { PostgresKycProviderEventRepository } from './kyc/infrastructure/PostgresKycProviderEventRepository.js'
 import { PostgresKycSessionRepository } from './kyc/infrastructure/PostgresKycSessionRepository.js'
@@ -29,6 +38,7 @@ import {
   type MockHostedKycOperations,
 } from './routes/dev/mockKycRoutes.js'
 import { createV1Router } from './routes/v1/meRoutes.js'
+import { createCryptoProviderEventRouter } from './routes/internal/cryptoProviderEventRoutes.js'
 import { errorHandler } from './shared/http/errorHandler.js'
 import { notFoundHandler } from './shared/http/notFoundHandler.js'
 import { createRequestContextMiddleware } from './shared/http/requestContext.js'
@@ -60,6 +70,7 @@ export interface CreateAppDependencies {
   getCurrentPlayer?: GetCurrentPlayerService
   kycProvider?: KycProvider
   mockHostedKyc?: MockHostedKycOperations
+  cryptoFundingProvider?: CryptoFundingProvider
   clock?: () => Date
 }
 
@@ -86,12 +97,22 @@ export function createApp(dependencies: CreateAppDependencies) {
   const kycProfiles = new PostgresKycProfileRepository()
   const kycSessions = new PostgresKycSessionRepository()
   const kycTransitions = new PostgresKycStatusTransitionRepository()
+  const kycReviews = new PostgresKycManualReviewRepository()
+  const clock = dependencies.clock ?? (() => new Date())
+  const transitionKycStatus = new TransitionKycStatusService(
+    kycProfiles,
+    kycTransitions,
+    kycReviews,
+    new PostgresAuditRepository(),
+    clock,
+  )
   const kycStatuses = new PostgresKycStatusReader(
     pool,
     kycProfiles,
     new PostgresAuditRepository(),
+    transitionKycStatus,
+    clock,
   )
-  const clock = dependencies.clock ?? (() => new Date())
   const kycProvider =
     dependencies.kycProvider ??
     new FakeKycProvider(
@@ -109,6 +130,35 @@ export function createApp(dependencies: CreateAppDependencies) {
     kycStatuses,
     clock,
   )
+  const cryptoRepository = new PostgresCryptoFundingRepository()
+  const cryptoTransitions = new TransitionCryptoFundingService(
+    cryptoRepository,
+    new PostgresAuditRepository(),
+    clock,
+  )
+  const cryptoProvider = dependencies.cryptoFundingProvider ??
+    (config.crypto.fundingEnabled && config.crypto.provider === 'fake' && config.crypto.fakeWebhookSecret
+      ? new FakeCryptoFundingProvider(config.crypto.fakeWebhookSecret)
+      : null)
+  const cryptoAssetPolicies: CryptoAssetPolicy[] = config.crypto.supportedAssets.map((asset) => ({
+    ...asset,
+    minimumAmount: config.crypto.minimumAmount,
+    maximumAmount: config.crypto.maximumAmount,
+  }))
+  const createCryptoFundingIntent = new CreateCryptoFundingIntentService(
+    pool,
+    new PostgresPlayerRepository(),
+    cryptoRepository,
+    cryptoTransitions,
+    new PostgresAuditRepository(),
+    eligibility,
+    cryptoProvider,
+    config.crypto.fundingEnabled,
+    cryptoAssetPolicies,
+    config.crypto.intentTtlMinutes * 60_000,
+    clock,
+  )
+  const getCryptoFundingIntent = new GetCryptoFundingIntentService(pool, cryptoRepository)
   const getCurrentPlayer =
     dependencies.getCurrentPlayer ??
     new GetCurrentPlayerService(
@@ -121,13 +171,14 @@ export function createApp(dependencies: CreateAppDependencies) {
     kycProfiles,
     kycSessions,
     new PostgresAuditRepository(),
+    transitionKycStatus,
   )
   const startKycVerification = new StartKycVerificationService(
     pool,
     new PostgresPlayerRepository(),
     kycProfiles,
     kycSessions,
-    kycTransitions,
+    transitionKycStatus,
     new PostgresAuditRepository(),
     eligibility,
     kycProvider,
@@ -139,7 +190,12 @@ export function createApp(dependencies: CreateAppDependencies) {
   app.disable('x-powered-by')
   app.use(createRequestContextMiddleware(logger))
   app.use(createCorsMiddleware(config.cors.allowedOrigins))
-  app.use(express.json({ limit: '100kb' }))
+  app.use(express.json({
+    limit: '100kb',
+    verify: (request, _response, buffer) => {
+      ;(request as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer)
+    },
+  }))
 
   app.use('/health', createHealthRouter(pool, logger))
   app.get('/health', (_request, response) => {
@@ -155,8 +211,23 @@ export function createApp(dependencies: CreateAppDependencies) {
       resolvePlayer: resolver,
       getKycProfile,
       startKycVerification,
+      createCryptoFundingIntent,
+      getCryptoFundingIntent,
     }),
   )
+  if (cryptoProvider) {
+    const processCryptoProviderEvent = new ProcessCryptoProviderEventService(
+      pool,
+      cryptoRepository,
+      cryptoTransitions,
+      new PostgresAuditRepository(),
+      cryptoProvider,
+      cryptoAssetPolicies,
+      config.crypto.providerMaxFutureSkewSeconds * 1_000,
+      clock,
+    )
+    app.use('/internal', createCryptoProviderEventRouter(cryptoProvider.providerName, processCryptoProviderEvent))
+  }
   app.use('/auth', createAuthRoutes(requireIdentity, getCurrentPlayer))
   if (isMockHostedKycEnabled(config)) {
     if (!config.kyc.publicApiBaseUrl) {
@@ -175,11 +246,12 @@ export function createApp(dependencies: CreateAppDependencies) {
           kycProfiles,
           kycSessions,
           new PostgresKycProviderEventRepository(),
-          kycTransitions,
+          transitionKycStatus,
           new PostgresAuditRepository(),
           kycProvider,
           config.kyc.verificationTtlDays * 24 * 60 * 60_000,
           clock,
+          config.kyc.providerMaxFutureSkewSeconds * 1_000,
         )
         return new MockHostedKycService(
           pool,

@@ -4,6 +4,8 @@ import { loadConfig } from './config/config.js'
 import { checkDatabaseHealth } from './shared/db/health.js'
 import { closeDatabasePool, createDatabasePool } from './shared/db/pool.js'
 import { createLogger } from './shared/observability/logger.js'
+import { createKycExpiryWorker } from './kyc/application/KycExpiryWorker.js'
+import { createCryptoFundingExpiryWorker } from './crypto/application/CryptoFundingExpiryWorker.js'
 
 const SHUTDOWN_TIMEOUT_MS = 10_000
 
@@ -20,6 +22,8 @@ async function main(): Promise<void> {
   const logger = createLogger(config.environment)
   const pool = createDatabasePool(config.database.url)
   let server: Server | null = null
+  const expiryWorker = createKycExpiryWorker(pool, logger)
+  const cryptoExpiryWorker = createCryptoFundingExpiryWorker(pool, logger)
 
   try {
     await checkDatabaseHealth(pool)
@@ -30,6 +34,8 @@ async function main(): Promise<void> {
       server!.listen(config.port, resolve)
     })
     logger.info({ event: 'service_started', port: config.port, environment: config.environment })
+    expiryWorker.start()
+    cryptoExpiryWorker.start()
 
     let shuttingDown = false
     const shutdown = async (signal: string): Promise<void> => {
@@ -45,6 +51,8 @@ async function main(): Promise<void> {
         await Promise.race([
           (async () => {
             if (server) await closeHttpServer(server)
+            await expiryWorker.stop()
+            await cryptoExpiryWorker.stop()
             await closeDatabasePool(pool)
           })(),
           timeout,
@@ -60,6 +68,8 @@ async function main(): Promise<void> {
     process.once('SIGTERM', () => void shutdown('SIGTERM'))
     process.once('SIGINT', () => void shutdown('SIGINT'))
   } catch (error) {
+    await expiryWorker.stop().catch(() => undefined)
+    await cryptoExpiryWorker.stop().catch(() => undefined)
     await closeDatabasePool(pool).catch(() => undefined)
     throw error
   }

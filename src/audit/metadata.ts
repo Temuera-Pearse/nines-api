@@ -1,4 +1,5 @@
-const SENSITIVE_KEY = /authorization|bearer|cookie|password|secret|token|jwt|database.?url/i
+const SENSITIVE_KEY =
+  /authorization|bearer|cookie|password|secret|token|jwt|database.?url|document|image|biometric|selfie|full.?name|date.?of.?birth|\bdob\b|address|passport|licen[cs]e|national.?id|social.?security|\bssn\b|identity.?number/i
 
 function sanitizeValue(value: unknown, depth: number): unknown {
   if (depth > 4) return '[TRUNCATED]'

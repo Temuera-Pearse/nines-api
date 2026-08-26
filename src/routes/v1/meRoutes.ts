@@ -4,8 +4,9 @@ import type { GetCurrentPlayerService } from '../../players/application/GetCurre
 import { AppError } from '../../shared/http/AppError.js'
 import { requireRequestContext } from '../../shared/http/requestContext.js'
 import { createKycRouter, type KycRouteDependencies } from './kycRoutes.js'
+import { createCryptoFundingRouter, type CryptoFundingRouteDependencies } from './cryptoFundingRoutes.js'
 
-export interface MeRouteDependencies extends KycRouteDependencies {
+export interface MeRouteDependencies extends KycRouteDependencies, CryptoFundingRouteDependencies {
   requireIdentity: RequestHandler
   getCurrentPlayer: GetCurrentPlayerService
 }
@@ -38,5 +39,6 @@ export function createV1Router(dependencies: MeRouteDependencies): Router {
   const router = Router()
   router.get('/me', dependencies.requireIdentity, createMeHandler(dependencies.getCurrentPlayer))
   router.use(createKycRouter(dependencies))
+  router.use(createCryptoFundingRouter(dependencies))
   return router
 }

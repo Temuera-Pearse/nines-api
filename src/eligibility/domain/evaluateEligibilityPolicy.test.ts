@@ -58,6 +58,10 @@ describe('eligibility policy v1', () => {
       allowed: false,
       reasonCodes: ['DEPOSITS_BLOCKED'],
     })
+    expect(evaluate('deposit', { activeRestrictionTypes: ['jurisdiction_blocked'] })).toEqual({
+      allowed: false,
+      reasonCodes: ['JURISDICTION_BLOCKED'],
+    })
     expect(evaluate('withdraw', { activeRestrictionTypes: ['withdrawals_blocked'] })).toEqual({
       allowed: false,
       reasonCodes: ['WITHDRAWALS_BLOCKED'],

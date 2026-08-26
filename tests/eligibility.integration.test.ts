@@ -351,7 +351,10 @@ describe('persisted eligibility decisions', () => {
         { player, operation: 'deposit' },
         actor('corr-deposit'),
       ),
-    ).resolves.toMatchObject({ allowed: false, reasonCodes: ['DEPOSITS_BLOCKED'] })
+    ).resolves.toMatchObject({
+      allowed: false,
+      reasonCodes: ['DEPOSITS_BLOCKED', 'JURISDICTION_BLOCKED'],
+    })
     await expect(
       service.execute(
         { player, operation: 'withdraw' },

@@ -10,20 +10,24 @@ authoritative for money and `nines-back-end` remains authoritative for races.
 
 ## Checkpoint scope
 
-This working tree is the Phase 1–3.5 checkpoint:
+This working tree is the Phase 1–4 checkpoint:
 
 | Phase | Status | Scope |
 |---|---|---|
 | 1 | Complete | Auth0 human authentication, stable internal player identity, restricted-by-default provisioning, account-state history, audit, and PostgreSQL runtime foundation. |
 | 2 | Complete | Versioned eligibility policy, player restrictions, persisted decisions, permission projection, and deny-by-default authorization inputs. |
 | 3 | Complete | Provider-neutral KYC profiles, sessions, transitions, normalized provider events, idempotency, ordering, expiry logic, and eligibility integration. |
-| 3.5 | Complete for development | End-to-end Auth0 sign-in-to-KYC flow using the hosted mock provider, popup-compatible session URLs, pass/fail processing through the normal provider-event pipeline, and frontend refresh compatibility. |
+| 3.5 | Complete | Central lifecycle transitions, provider-event ownership/idempotency/ordering, auditable manual review, approval expiry worker, and request-time protection. |
+| 4 | Complete | Provider-neutral external crypto funding intents, fake-provider sessions, authenticated callbacks, reconciliation, expiry, and a durable financial-instruction outbox. |
 
-Phase 3.5 proves the complete integration boundary without pretending to
-perform real identity verification. The frontend implementation lives in the
-separate `nines-front-end` repository; this repository owns the protected API,
-hosted development page, provider-event processing, persistence, and response
-contracts used by that flow.
+The hosted mock proves the integration boundary without pretending to perform
+real identity verification. Phase 3.5 additionally hardens the complete KYC
+lifecycle. See
+[`docs/PHASE_3_5_KYC_LIFECYCLE_HARDENING.md`](docs/PHASE_3_5_KYC_LIFECYCLE_HARDENING.md)
+for transition, event, review, expiry, and concurrency rules.
+See [`docs/PHASE_4_CRYPTO_FUNDING.md`](docs/PHASE_4_CRYPTO_FUNDING.md) for the
+crypto lifecycle, provider contract, exact-amount, callback, reconciliation,
+and outbox rules.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for completed scope and deferred work.
 
@@ -67,8 +71,17 @@ commit environment files or real connection credentials.
 | `KYC_PROVIDER` | No | Phase 3 supports only `fake`. |
 | `KYC_SESSION_TTL_MINUTES` | No | Positive session lifetime; default `60`. |
 | `KYC_VERIFICATION_TTL_DAYS` | No | Positive verified-profile lifetime; default `365`. |
+| `KYC_PROVIDER_MAX_FUTURE_SKEW_SECONDS` | No | Maximum accepted provider event clock lead; default `300`. |
 | `ENABLE_FAKE_KYC_TEST_ROUTES` | No | Enables the hosted mock page and outcome endpoint in development/test. Default `false`; production rejects `true`. |
 | `PUBLIC_API_BASE_URL` | Hosted mock flow | Public API origin used to build mock provider URLs; defaults to `http://localhost:<PORT>` outside production. |
+| `CRYPTO_FUNDING_ENABLED` | No | Defaults to `false`; requires an explicitly configured supported provider. |
+| `CRYPTO_PROVIDER` | When funding enabled | Phase 4 supports only `fake`, and rejects enabled fake funding in production. |
+| `CRYPTO_SUPPORTED_ASSETS` | No | Comma-separated `ASSET:DECIMALS` values; default `USDC:6`. |
+| `CRYPTO_FUNDING_MIN_AMOUNT` | No | Positive exact decimal string; default `1`. |
+| `CRYPTO_FUNDING_MAX_AMOUNT` | No | Positive exact decimal string; default `100000`. |
+| `CRYPTO_FUNDING_INTENT_TTL_MINUTES` | No | Positive internal intent lifetime; default `60`. |
+| `CRYPTO_PROVIDER_MAX_FUTURE_SKEW_SECONDS` | No | Maximum accepted provider timestamp lead; default `300`. |
+| `CRYPTO_FAKE_WEBHOOK_SECRET` | Fake funding | At least 16 characters; development/test only. |
 | `TEST_DATABASE_URL` | Integration tests | Dedicated PostgreSQL database ending in `_test`. |
 
 Unsupported providers, invalid TTLs, fake production route configuration,
@@ -82,6 +95,8 @@ Migrations are applied in order:
 1. `001_phase_1_player_identity.sql`
 2. `002_phase_2_eligibility.sql`
 3. `003_phase_3_kyc.sql`
+4. `004_phase_3_5_kyc_lifecycle_hardening.sql`
+5. `005_phase_4_crypto_funding.sql`
 
 Phase 3 adds:
 
@@ -92,6 +107,8 @@ Phase 3 adds:
 - `kyc_provider_events`: normalized event identity, deterministic SHA-256 hash,
   processing outcome, sanitized metadata, and correlation data.
 - `kyc_status_transitions`: immutable profile-state history.
+- `kyc_manual_reviews` and `kyc_manual_review_actions`: controlled review state
+  and immutable review-action history.
 
 Database enforcement includes:
 
@@ -104,9 +121,32 @@ Database enforcement includes:
 - append-only KYC transition triggers;
 - immutable provider-event identity fields and no event deletion;
 - indexes by player, session, correlation, event reference, expiry, and time.
+- a deferred guard requiring every committed profile status change to have a
+  matching transition for the new profile version.
 
 No documents, photographs, biometrics, raw provider payloads, raw headers,
 access tokens, or full identity details are stored.
+
+Phase 4 adds funding intents and provider sessions, normalized callback events,
+append-only funding transitions, explicit reconciliation records, and the
+`financial_funding_instructions` outbox. Critical idempotency keys are unique
+in PostgreSQL, and a deferred trigger requires every status change to have a
+matching transition record.
+
+## Crypto funding API
+
+Authenticated players use `POST /v1/crypto/funding-intents` with an
+`Idempotency-Key`, then owner-scoped `GET /v1/crypto/funding-intents` and
+`GET /v1/crypto/funding-intents/:id`. Creation reuses the existing `deposit`
+eligibility decision. The internal intent UUID is the external provider's
+mandatory idempotency key.
+
+Authenticated provider events enter at
+`POST /internal/provider-events/crypto/:provider`. The fake provider separates
+`detected`, `confirming`, and `confirmed`; only final confirmation atomically
+creates one durable financial instruction. Mismatched or late external value
+is reconciled rather than credited. No player balance or ledger is implemented
+here. See the Phase 4 document for the full contract.
 
 ```bash
 npm run db:migrate
@@ -128,13 +168,13 @@ Allowed transitions are:
 ```text
 not_started -> pending
 pending -> verified | failed | manual_review | expired
-manual_review -> verified | failed | expired
-verified -> expired
+manual_review -> verified | failed | pending | expired
+verified -> expired | manual_review
 failed -> pending
 expired -> pending
 ```
 
-No-op transitions and direct backwards transitions are rejected. In particular,
+No-op and unsupported transitions return `KYC_INVALID_STATE_TRANSITION`. In particular,
 `verified -> pending`, `verified -> failed`, `failed -> verified`, and
 `expired -> verified` are invalid without the correct new-session progression.
 A failed or expired player may start a new attempt and transition back to
@@ -151,17 +191,20 @@ boundary. They do not enter the player-facing profile vocabulary.
 2. transactionally create/read the profile, lock it, reuse an active or
    idempotent session, or create a `creating` intent;
 3. commit the intent;
-4. call `KycProvider.createVerificationSession` with no open transaction;
+4. call `KycProvider.createVerificationSession` with no open transaction, using
+   the immutable internal session UUID as the mandatory provider idempotency key;
 5. transactionally activate the intent and move the profile to `pending`;
 6. append transition and audit records.
 
 Concurrent requests converge on one effective session. When hosted mock routes
 are enabled, the fake provider uses the validated `PUBLIC_API_BASE_URL` and
 internal session UUID to produce a deterministic hosted verification URL.
-Repeated
-`Idempotency-Key` values resolve to the same stored attempt. A provider failure
-marks the intent `creation_failed`, keeps the profile unchanged, emits a safe
-503, and leaves a later attempt recoverable.
+Repeated `Idempotency-Key` values resolve to the same stored attempt. Every real
+adapter must map the supplied internal-session idempotency key to its provider's
+idempotency facility. A provider failure marks the intent `creation_failed`,
+keeps the profile unchanged, and deterministically replays the safe
+`503 KYC_SESSION_CREATION_FAILED` response for that client key. A new attempt
+requires a new client `Idempotency-Key`.
 
 An already verified, unexpired profile returns `KYC_ALREADY_VERIFIED`. Closed
 accounts are denied by `eligibility-policy-v1`.
@@ -172,14 +215,19 @@ accounts are denied by `eligibility-policy-v1`.
 
 1. verifies and normalizes through the configured `KycProvider`;
 2. hashes a canonical representation of the controlled event input;
-3. inserts `(provider, provider_event_id)` idempotently;
+3. inserts `(provider, provider_event_id)` idempotently and rejects identity
+   reuse with different content;
 4. locks the provider-scoped session and current profile;
-5. applies ordering and transition rules;
-6. atomically updates the session/profile, transition, event outcome, and audit
+5. rejects excessive provider clock skew and, while holding the session lock,
+   expires sessions whose expiry is at or before the internal receipt time;
+6. applies ownership, ordering, and transition rules;
+7. atomically updates the session/profile, transition, event outcome, and audit
    records.
 
-Only normalized status, operational references, event type/time, hash, and
-sanitized metadata are persisted. Raw provider requests are not retained.
+Only normalized status, operational references, separate provider/receipt/
+acceptance times, event hash, and explicitly allowlisted adapter metadata are
+persisted. The current fake adapter allows only `source`; unknown and sensitive
+metadata fields are discarded. Raw provider requests are not retained.
 
 Ordering rules are:
 
@@ -191,10 +239,21 @@ Ordering rules are:
 - an older attempt cannot overwrite a newer attempt;
 - the first valid terminal result serialized under the session row lock wins;
 - duplicates return the existing event identity and do not reapply state.
+- provider time may lead internal receipt time by at most the configured skew;
+- receipt/acceptance time, never provider time, starts verification validity.
 
 Stale and unknown-session events remain recorded as `ignored_stale` or
-`rejected`. Duplicate delivery emits an `ignored_duplicate` audit event without
+`rejected`. A claimed player must match the owner resolved from the stored
+session. Duplicate delivery emits an `ignored_duplicate` audit event without
 rewriting the original processed record.
+
+## Manual review
+
+Entering `manual_review` creates one active review and an immutable requested
+action. Internal application methods support open, assignment, approval,
+rejection, and resumption; decisions pass through the central transition
+service. Admin HTTP routes remain intentionally absent until the repository has
+authenticated internal/admin identity middleware.
 
 ## Phase 3.5 development end-to-end flow
 
@@ -256,16 +315,22 @@ normal 404 when disabled.
 
 ## Expiry
 
-`ExpireKycSessionsService` accepts an injected `now` value and is ready for a
-future scheduler or worker.
+`KycExpiryWorker` starts with the API and invokes `ExpireKycSessionsService`
+once per minute with independent bounded batches of 100 sessions and 100
+verified profiles.
 
 - Pending/manual-review sessions past expiry become `expired`.
 - A profile changes only when the expired session is still current.
 - Verified profiles with elapsed `expires_at` become `expired`.
 - Obsolete sessions cannot expire a newer profile.
 - Repeated expiry runs are idempotent.
+- Ordered `FOR UPDATE SKIP LOCKED` claims make concurrent workers safe.
+- Session backlog cannot consume verified-profile expiry capacity.
+- Category failures are reported independently and do not prevent the other
+  category from being attempted.
+- Request-time status/profile reads expire overdue approvals synchronously.
 
-The Phase 1–3.5 checkpoint adds no scheduler or queue.
+All times are PostgreSQL `TIMESTAMPTZ`/UTC instants.
 
 ## Eligibility integration
 
@@ -275,15 +340,16 @@ the first normal eligibility read lazily creates and audits that profile. An
 invalid stored value produces a deny-by-default policy input.
 
 `EvaluateEligibilityService` reads KYC itself inside each persisted evaluation.
-Callers cannot supply an arbitrary KYC status. `/v1/me` permission projections
-therefore use authoritative stored state.
+Callers cannot supply an arbitrary KYC status. `/v1/me` loads one consistent
+restriction/KYC snapshot in one transaction, evaluates all six permissions in
+memory, and persists the six decisions without six simultaneous connections.
 
 Policy v1 remains:
 
 | Operation | Rule |
 |---|---|
 | `view_races` | Allowed unless account is closed. |
-| `deposit` | Active account, verified KYC, no deposit/KYC-required block. |
+| `deposit` | Active account, verified KYC, no deposit, jurisdiction, or KYC-required block. |
 | `withdraw` | Active account, verified KYC, no withdrawal/KYC-required block. |
 | `place_wager` | Active account, verified KYC, no wagering, self-exclusion, jurisdiction, security-review, or KYC-required block. |
 | `start_kyc` | Allowed unless account is closed. |
@@ -350,13 +416,18 @@ KYC emits:
   `kyc.session_failed`
 - `kyc.event_received`, `kyc.event_processed`,
   `kyc.event_ignored_duplicate`, `kyc.event_ignored_stale`,
+  `kyc.event_ignored_expired_session`, `kyc.event_identity_conflict`,
   `kyc.event_rejected`
 - `kyc.status_changed`
+- `kyc.manual_review_opened`, `kyc.manual_review_assigned`
 - `kyc.session_expired`, `kyc.verification_expired`
 
-Audit and provider-event metadata are recursively sanitized. Public errors use
+General audit metadata is recursively sanitized; provider-event metadata uses
+an adapter-specific allowlist. Public errors use
 stable codes such as `KYC_ALREADY_VERIFIED`, `KYC_SESSION_CREATION_FAILED`,
-`KYC_EVENT_INVALID`, `KYC_TRANSITION_INVALID`, `KYC_OPERATION_NOT_ALLOWED`, and
+`KYC_EVENT_INVALID`, `KYC_INVALID_STATE_TRANSITION`,
+`KYC_PROVIDER_SESSION_NOT_FOUND`, `KYC_PROVIDER_MISMATCH`,
+`KYC_PLAYER_MISMATCH`, `KYC_REVIEW_NOT_FOUND`, `KYC_OPERATION_NOT_ALLOWED`, and
 `KYC_STATE_CONFLICT`. Provider and PostgreSQL details remain internal.
 
 ## Local workflow
@@ -394,17 +465,14 @@ None of these directories are part of the production build or migration plan.
 
 ## Deferred work
 
-Phases 3 and 3.5 deliberately defer:
+Phases 3 through 4 deliberately defer:
 
 - a real KYC provider and production webhook authentication;
 - provider-managed document and biometric handling;
 - identity-document upload or storage;
-- operator/manual-review APIs;
-- the scheduled expiry worker;
+- authenticated operator HTTP routes for the implemented manual-review service;
 - notification, email, and SMS integrations;
 - jurisdiction and geolocation providers;
 - responsible-gambling integrations;
-- payments, crypto, deposits, withdrawals, wallets, ledgers, betting, and race
-  integration.
-
-Phase 4 has not been started.
+- real crypto providers, custody, wallets, keys, conversion, financial outbox
+  delivery, balances, ledgers, withdrawals, betting, and race integration.

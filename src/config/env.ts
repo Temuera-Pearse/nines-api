@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { compareCryptoAmounts, normalizeCryptoAsset, parseCryptoAmount } from '../crypto/domain/CryptoAmount.js'
 
 const nodeEnvironmentSchema = z.enum(['development', 'test', 'production'])
 
@@ -12,8 +13,17 @@ export interface ParsedEnvironment {
   kycProvider: 'fake'
   kycSessionTtlMinutes: number
   kycVerificationTtlDays: number
+  kycProviderMaxFutureSkewSeconds: number
   enableFakeKycTestRoutes: boolean
   publicApiBaseUrl: string | null
+  cryptoFundingEnabled: boolean
+  cryptoProvider: 'fake' | null
+  cryptoSupportedAssets: Array<{ asset: string; decimals: number }>
+  cryptoFundingMinimumAmount: string
+  cryptoFundingMaximumAmount: string
+  cryptoFundingIntentTtlMinutes: number
+  cryptoProviderMaxFutureSkewSeconds: number
+  cryptoFakeWebhookSecret: string | null
 }
 
 export interface ParseEnvironmentOptions {
@@ -112,6 +122,25 @@ function parseBoolean(value: string | undefined, name: string): boolean {
   throw new Error(`${name} must be true or false`)
 }
 
+function parseCryptoAssets(value: string | undefined): Array<{ asset: string; decimals: number }> {
+  const entries = (value ?? 'USDC:6').split(',').map((item) => item.trim()).filter(Boolean)
+  const parsed = entries.map((entry) => {
+    const [rawAsset, rawDecimals, extra] = entry.split(':')
+    if (!rawAsset || !rawDecimals || extra !== undefined) throw new Error('CRYPTO_SUPPORTED_ASSETS must use ASSET:DECIMALS entries')
+    const asset = normalizeCryptoAsset(rawAsset)
+    const decimals = Number(rawDecimals)
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 30) throw new Error('CRYPTO_SUPPORTED_ASSETS decimals must be between 0 and 30')
+    return { asset, decimals }
+  })
+  if (!parsed.length || new Set(parsed.map((entry) => entry.asset)).size !== parsed.length) throw new Error('CRYPTO_SUPPORTED_ASSETS must contain unique assets')
+  return parsed
+}
+
+function parseCryptoAmountRange(value: string | undefined, fallback: string, name: string): string {
+  try { return parseCryptoAmount(value ?? fallback, 30).canonical }
+  catch { throw new Error(`${name} must be a positive decimal string`) }
+}
+
 function parsePublicApiBaseUrl(
   value: string | undefined,
   nodeEnvironment: ParsedEnvironment['nodeEnvironment'],
@@ -163,6 +192,25 @@ export function parseEnvironment(
   if (nodeEnvironment === 'production' && enableFakeKycTestRoutes) {
     throw new Error('ENABLE_FAKE_KYC_TEST_ROUTES cannot be enabled in production')
   }
+  const cryptoFundingEnabled = parseBoolean(source.CRYPTO_FUNDING_ENABLED, 'CRYPTO_FUNDING_ENABLED')
+  const cryptoProviderValue = source.CRYPTO_PROVIDER?.trim() || null
+  if (cryptoProviderValue !== null && cryptoProviderValue !== 'fake') throw new Error('CRYPTO_PROVIDER must be fake when configured')
+  if (cryptoFundingEnabled && cryptoProviderValue !== 'fake') throw new Error('CRYPTO_PROVIDER=fake is required when crypto funding is enabled')
+  if (nodeEnvironment === 'production' && cryptoFundingEnabled) throw new Error('The fake crypto provider cannot be enabled in production')
+  const cryptoFakeWebhookSecret = source.CRYPTO_FAKE_WEBHOOK_SECRET?.trim() || null
+  if (cryptoFundingEnabled && (!cryptoFakeWebhookSecret || cryptoFakeWebhookSecret.length < 16)) throw new Error('CRYPTO_FAKE_WEBHOOK_SECRET must contain at least 16 characters when crypto funding is enabled')
+  const cryptoSupportedAssets = parseCryptoAssets(source.CRYPTO_SUPPORTED_ASSETS)
+  const cryptoFundingMinimumAmount = parseCryptoAmountRange(source.CRYPTO_FUNDING_MIN_AMOUNT, '1', 'CRYPTO_FUNDING_MIN_AMOUNT')
+  const cryptoFundingMaximumAmount = parseCryptoAmountRange(source.CRYPTO_FUNDING_MAX_AMOUNT, '100000', 'CRYPTO_FUNDING_MAX_AMOUNT')
+  if (compareCryptoAmounts(parseCryptoAmount(cryptoFundingMinimumAmount, 30), parseCryptoAmount(cryptoFundingMaximumAmount, 30)) > 0) throw new Error('CRYPTO_FUNDING_MIN_AMOUNT must not exceed CRYPTO_FUNDING_MAX_AMOUNT')
+  for (const { asset, decimals } of cryptoSupportedAssets) {
+    try {
+      parseCryptoAmount(cryptoFundingMinimumAmount, decimals)
+      parseCryptoAmount(cryptoFundingMaximumAmount, decimals)
+    } catch {
+      throw new Error(`Crypto funding amount range exceeds configured precision for ${asset}`)
+    }
+  }
 
   return {
     nodeEnvironment,
@@ -185,11 +233,24 @@ export function parseEnvironment(
       365,
       'KYC_VERIFICATION_TTL_DAYS',
     ),
+    kycProviderMaxFutureSkewSeconds: parsePositiveInteger(
+      source.KYC_PROVIDER_MAX_FUTURE_SKEW_SECONDS,
+      300,
+      'KYC_PROVIDER_MAX_FUTURE_SKEW_SECONDS',
+    ),
     enableFakeKycTestRoutes,
     publicApiBaseUrl: parsePublicApiBaseUrl(
       source.PUBLIC_API_BASE_URL,
       nodeEnvironment,
       port,
     ),
+    cryptoFundingEnabled,
+    cryptoProvider: cryptoProviderValue,
+    cryptoSupportedAssets,
+    cryptoFundingMinimumAmount,
+    cryptoFundingMaximumAmount,
+    cryptoFundingIntentTtlMinutes: parsePositiveInteger(source.CRYPTO_FUNDING_INTENT_TTL_MINUTES, 60, 'CRYPTO_FUNDING_INTENT_TTL_MINUTES'),
+    cryptoProviderMaxFutureSkewSeconds: parsePositiveInteger(source.CRYPTO_PROVIDER_MAX_FUTURE_SKEW_SECONDS, 300, 'CRYPTO_PROVIDER_MAX_FUTURE_SKEW_SECONDS'),
+    cryptoFakeWebhookSecret,
   }
 }

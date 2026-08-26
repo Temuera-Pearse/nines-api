@@ -17,8 +17,19 @@ export interface AppConfig {
     provider: 'fake'
     sessionTtlMinutes: number
     verificationTtlDays: number
+    providerMaxFutureSkewSeconds: number
     enableFakeTestRoutes: boolean
     publicApiBaseUrl: string | null
+  }>
+  readonly crypto: Readonly<{
+    fundingEnabled: boolean
+    provider: 'fake' | null
+    supportedAssets: readonly Readonly<{ asset: string; decimals: number }>[]
+    minimumAmount: string
+    maximumAmount: string
+    intentTtlMinutes: number
+    providerMaxFutureSkewSeconds: number
+    fakeWebhookSecret: string | null
   }>
 }
 
@@ -37,8 +48,19 @@ export function loadConfig(
       provider: env.kycProvider,
       sessionTtlMinutes: env.kycSessionTtlMinutes,
       verificationTtlDays: env.kycVerificationTtlDays,
+      providerMaxFutureSkewSeconds: env.kycProviderMaxFutureSkewSeconds,
       enableFakeTestRoutes: env.enableFakeKycTestRoutes,
       publicApiBaseUrl: env.publicApiBaseUrl,
+    }),
+    crypto: Object.freeze({
+      fundingEnabled: env.cryptoFundingEnabled,
+      provider: env.cryptoProvider,
+      supportedAssets: Object.freeze(env.cryptoSupportedAssets.map((entry) => Object.freeze({ ...entry }))),
+      minimumAmount: env.cryptoFundingMinimumAmount,
+      maximumAmount: env.cryptoFundingMaximumAmount,
+      intentTtlMinutes: env.cryptoFundingIntentTtlMinutes,
+      providerMaxFutureSkewSeconds: env.cryptoProviderMaxFutureSkewSeconds,
+      fakeWebhookSecret: env.cryptoFakeWebhookSecret,
     }),
   })
 }

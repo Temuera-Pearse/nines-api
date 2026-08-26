@@ -26,7 +26,7 @@ const RESTRICTION_REASON: Partial<Record<RestrictionType, EligibilityReasonCode>
 
 const OPERATION_RESTRICTIONS: Record<PlayerOperation, readonly RestrictionType[]> = {
   view_races: [],
-  deposit: ['deposits_blocked', 'kyc_required'],
+  deposit: ['deposits_blocked', 'jurisdiction_blocked', 'kyc_required'],
   withdraw: ['withdrawals_blocked', 'kyc_required'],
   place_wager: [
     'wagering_blocked',

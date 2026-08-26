@@ -10,7 +10,7 @@
     "build": "npm run clean && tsc",
     "start": "node dist/server.js",
     "test": "vitest run",
-    "test:integration:db": "vitest run --config vitest.integration.config.ts",
+    "test:integration:db": "node --env-file-if-exists=.env.local ./node_modules/vitest/vitest.mjs run --config vitest.integration.config.ts",
     "test:watch": "vitest",
     "db:migrate": "node --env-file-if-exists=.env.local --import tsx src/cli/migrate.ts",
     "db:migrate:test": "node --env-file-if-exists=.env.local --import tsx src/cli/migrate.ts --test",

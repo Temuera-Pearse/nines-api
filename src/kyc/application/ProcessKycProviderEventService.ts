@@ -9,7 +9,6 @@ import {
   type NormalizedKycProviderEvent,
   type StoredKycProviderEvent,
 } from '../domain/KycProviderEvent.js'
-import type { KycReasonCode } from '../domain/KycReasonCode.js'
 import type { KycProfile } from '../domain/KycProfile.js'
 import type { KycSession, KycSessionStatus } from '../domain/KycSession.js'
 import type { KycStatus } from '../domain/KycStatus.js'
@@ -17,13 +16,13 @@ import { canTransitionKycStatus } from '../domain/KycTransition.js'
 import type { KycProfileRepository } from '../infrastructure/KycProfileRepository.js'
 import type { KycProviderEventRepository } from '../infrastructure/KycProviderEventRepository.js'
 import type { KycSessionRepository } from '../infrastructure/KycSessionRepository.js'
-import type { KycStatusTransitionRepository } from '../infrastructure/KycStatusTransitionRepository.js'
 import {
   type KycProvider,
   type KycProviderEventInput,
   KycProviderInputError,
 } from '../providers/KycProvider.js'
 import type { KycActorContext } from './KycContext.js'
+import type { TransitionKycStatusService } from './TransitionKycStatusService.js'
 
 export interface ProcessKycProviderEventResult {
   eventId: string
@@ -32,16 +31,18 @@ export interface ProcessKycProviderEventResult {
   reasonCode: string | null
 }
 
-const RESULT_REASON: Record<
-  Exclude<KycStatus, 'not_started'>,
-  KycReasonCode
-> = {
+interface PostCommitRejectedOutcome {
+  result: ProcessKycProviderEventResult
+  postCommitError: AppError
+}
+
+const RESULT_REASON = {
   pending: 'KYC_SESSION_STARTED',
   verified: 'KYC_PROVIDER_VERIFIED',
   failed: 'KYC_PROVIDER_FAILED',
   manual_review: 'KYC_PROVIDER_MANUAL_REVIEW',
   expired: 'KYC_SESSION_EXPIRED',
-}
+} as const
 
 export class ProcessKycProviderEventService {
   constructor(
@@ -49,11 +50,12 @@ export class ProcessKycProviderEventService {
     private readonly profiles: KycProfileRepository,
     private readonly sessions: KycSessionRepository,
     private readonly events: KycProviderEventRepository,
-    private readonly transitions: KycStatusTransitionRepository,
+    private readonly transitionKycStatus: TransitionKycStatusService,
     private readonly audit: AuditRepository,
     private readonly provider: KycProvider,
     private readonly verificationTtlMs: number,
     private readonly clock: () => Date = () => new Date(),
+    private readonly maxFutureSkewMs = 5 * 60_000,
   ) {}
 
   async execute(
@@ -64,6 +66,8 @@ export class ProcessKycProviderEventService {
     try {
       normalized = await this.provider.verifyAndNormalizeEvent(input)
     } catch (cause) {
+      const reasonCode =
+        cause instanceof KycProviderInputError ? cause.reasonCode : 'KYC_EVENT_INVALID'
       await this.audit.append(
         {
           id: randomUUID(),
@@ -72,7 +76,7 @@ export class ProcessKycProviderEventService {
           playerId: null,
           action: 'kyc.event_rejected',
           outcome: 'rejected',
-          reasonCode: 'KYC_EVENT_INVALID',
+          reasonCode,
           correlationId: actor.correlationId,
           metadata: { provider: this.provider.providerName },
         },
@@ -80,14 +84,16 @@ export class ProcessKycProviderEventService {
       )
       throw new AppError({
         status: 400,
-        code: 'KYC_EVENT_INVALID',
+        code: reasonCode,
         message: 'KYC provider event is invalid',
         publicMessage: 'KYC event was rejected',
         cause: cause instanceof KycProviderInputError ? cause : undefined,
       })
     }
 
-    return withTransaction(this.pool, async (client) => {
+    const outcome = await withTransaction<
+      ProcessKycProviderEventResult | PostCommitRejectedOutcome
+    >(this.pool, async (client) => {
       const receivedAt = this.clock()
       const inserted = await this.events.insert(
         randomUUID(),
@@ -97,6 +103,35 @@ export class ProcessKycProviderEventService {
         client,
       )
       if (!inserted.created) {
+        if (
+          inserted.event.payloadHash !== normalized.payloadHash ||
+          inserted.event.providerSessionReference !== normalized.providerSessionReference ||
+          inserted.event.eventType !== normalized.eventType
+        ) {
+          await this.appendEventAudit(
+            'kyc.event_identity_conflict',
+            'rejected',
+            'KYC_PROVIDER_EVENT_IDENTITY_CONFLICT',
+            inserted.event,
+            null,
+            actor,
+            client,
+          )
+          return {
+            result: {
+              eventId: inserted.event.id,
+              processingStatus: 'rejected' as const,
+              resultingKycStatus: null,
+              reasonCode: 'KYC_PROVIDER_EVENT_IDENTITY_CONFLICT',
+            },
+            postCommitError: new AppError({
+              status: 409,
+              code: 'KYC_PROVIDER_EVENT_IDENTITY_CONFLICT',
+              message: 'KYC provider event identity was reused with different content',
+              publicMessage: 'KYC event was rejected',
+            }),
+          }
+        }
         const session = await this.sessions.findByProviderReferenceForUpdate(
           normalized.provider,
           normalized.providerSessionReference,
@@ -128,38 +163,100 @@ export class ProcessKycProviderEventService {
         actor,
         client,
       )
+      if (normalized.occurredAt.getTime() > receivedAt.getTime() + this.maxFutureSkewMs) {
+        return this.rejectEvent(
+          inserted.event,
+          'KYC_PROVIDER_EVENT_FUTURE_TIMESTAMP',
+          null,
+          actor,
+          receivedAt,
+          client,
+        )
+      }
+      if (normalized.provider !== this.provider.providerName) {
+        return this.rejectEvent(
+          inserted.event,
+          'KYC_PROVIDER_MISMATCH',
+          null,
+          actor,
+          receivedAt,
+          client,
+        )
+      }
       const session = await this.sessions.findByProviderReferenceForUpdate(
         normalized.provider,
         normalized.providerSessionReference,
         client,
       )
       if (!session) {
-        const rejected = await this.events.markProcessed(
-          inserted.event.id,
-          'rejected',
-          'KYC_PROVIDER_REFERENCE_MISMATCH',
-          this.clock(),
-          client,
-        )
-        await this.appendEventAudit(
-          'kyc.event_rejected',
-          'rejected',
-          'KYC_PROVIDER_REFERENCE_MISMATCH',
-          rejected,
+        return this.rejectEvent(
+          inserted.event,
+          'KYC_PROVIDER_SESSION_NOT_FOUND',
           null,
           actor,
+          receivedAt,
           client,
         )
-        return {
-          eventId: rejected.id,
-          processingStatus: rejected.processingStatus,
-          resultingKycStatus: null,
-          reasonCode: rejected.processingReasonCode,
-        }
       }
-
       const profile = await this.profiles.getForUpdate(session.playerId, client)
       if (!profile) throw new Error('KYC profile was not found for provider session')
+      const sessionExpired =
+        session.status === 'expired' ||
+        ((session.status === 'pending' || session.status === 'manual_review') &&
+          session.expiresAt !== null &&
+          session.expiresAt.getTime() <= receivedAt.getTime())
+      if (sessionExpired) {
+        const expiredSession =
+          session.status === 'expired'
+            ? session
+            : (await this.sessions.expireIfDue(session.id, receivedAt, client)) ?? session
+        let expiredProfile = profile
+        if (
+          profile.currentSessionId === session.id &&
+          (profile.status === 'pending' || profile.status === 'manual_review')
+        ) {
+          expiredProfile = await this.transitionKycStatus.execute(
+            {
+              playerId: profile.playerId,
+              toStatus: 'expired',
+              trigger: 'SESSION_EXPIRY',
+              reasonCode: 'KYC_SESSION_EXPIRED',
+              provider: session.provider,
+              sessionId: session.id,
+              verifiedAt: profile.verifiedAt,
+              expiresAt: session.expiresAt ?? receivedAt,
+              failureReasonCode: null,
+              metadata: {
+                expiredAt: (session.expiresAt ?? receivedAt).toISOString(),
+                source: 'provider_event_guard',
+              },
+            },
+            actor,
+            client,
+          )
+        }
+        return this.ignoreExpired(
+          inserted.event,
+          expiredProfile,
+          expiredSession,
+          actor,
+          receivedAt,
+          client,
+        )
+      }
+      if (
+        normalized.claimedPlayerReference !== null &&
+        normalized.claimedPlayerReference !== session.playerId
+      ) {
+        return this.rejectEvent(
+          inserted.event,
+          'KYC_PLAYER_MISMATCH',
+          session.playerId,
+          actor,
+          receivedAt,
+          client,
+        )
+      }
       if (
         isStaleKycEvent({
           event: normalized,
@@ -169,7 +266,7 @@ export class ProcessKycProviderEventService {
           sessionStatus: session.status,
         })
       ) {
-        return this.ignoreStale(inserted.event, profile, session, actor, client)
+        return this.ignoreStale(inserted.event, profile, session, actor, receivedAt, client)
       }
 
       if (normalized.resultingStatus === 'pending') {
@@ -186,7 +283,8 @@ export class ProcessKycProviderEventService {
           inserted.event.id,
           'processed',
           null,
-          this.clock(),
+          receivedAt,
+          receivedAt,
           client,
         )
         await this.appendEventAudit(
@@ -207,7 +305,7 @@ export class ProcessKycProviderEventService {
       }
 
       if (!canTransitionKycStatus(profile.status, normalized.resultingStatus)) {
-        return this.ignoreStale(inserted.event, profile, session, actor, client)
+        return this.ignoreStale(inserted.event, profile, session, actor, receivedAt, client)
       }
 
       const sessionStatus = normalized.resultingStatus as KycSessionStatus
@@ -217,7 +315,7 @@ export class ProcessKycProviderEventService {
           sessionId: session.id,
           status: sessionStatus,
           eventAt: normalized.occurredAt,
-          completedAt: terminal ? normalized.occurredAt : null,
+          completedAt: terminal ? receivedAt : null,
         },
         client,
       )
@@ -225,78 +323,40 @@ export class ProcessKycProviderEventService {
 
       const resultingStatus = normalized.resultingStatus
       const reasonCode = RESULT_REASON[resultingStatus]
-      const updatedProfile = await this.profiles.updateStatus(
+      const updatedProfile: KycProfile = await this.transitionKycStatus.execute(
         {
-          profileId: profile.id,
-          expectedVersion: profile.version,
-          status: resultingStatus,
+          playerId: profile.playerId,
+          toStatus: resultingStatus,
+          trigger: 'PROVIDER_EVENT',
+          reasonCode,
+          reasonCodes: normalized.reasonCode ? [normalized.reasonCode] : [],
           provider: session.provider,
-          currentSessionId: session.id,
+          sessionId: session.id,
+          providerEventRecordId: inserted.event.id,
+          providerEventId: normalized.providerEventId,
           verifiedAt:
-            resultingStatus === 'verified' ? normalized.occurredAt : profile.verifiedAt,
+            resultingStatus === 'verified' ? receivedAt : profile.verifiedAt,
           expiresAt:
             resultingStatus === 'verified'
-              ? new Date(normalized.occurredAt.getTime() + this.verificationTtlMs)
+              ? new Date(receivedAt.getTime() + this.verificationTtlMs)
               : resultingStatus === 'expired'
-                ? normalized.occurredAt
+                ? receivedAt
                 : null,
           failureReasonCode:
             resultingStatus === 'failed'
               ? 'KYC_PROVIDER_FAILED'
               : null,
+          metadata: { attemptNumber: session.attemptNumber },
         },
-        client,
-      )
-      if (!updatedProfile) {
-        throw new AppError({
-          status: 409,
-          code: 'KYC_STATE_CONFLICT',
-          message: 'KYC profile version conflict',
-        })
-      }
-      await this.transitions.append(
-        {
-          id: randomUUID(),
-          playerId: profile.playerId,
-          sessionId: session.id,
-          fromStatus: profile.status,
-          toStatus: updatedProfile.status,
-          reasonCode,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          providerEventId: inserted.event.id,
-          correlationId: actor.correlationId,
-          metadata: {
-            provider: session.provider,
-            attemptNumber: session.attemptNumber,
-          },
-        },
-        client,
-      )
-      await this.audit.append(
-        {
-          id: randomUUID(),
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          playerId: profile.playerId,
-          action: 'kyc.status_changed',
-          outcome: 'success',
-          reasonCode,
-          correlationId: actor.correlationId,
-          metadata: {
-            sessionId: session.id,
-            providerEventRecordId: inserted.event.id,
-            fromStatus: profile.status,
-            toStatus: updatedProfile.status,
-          },
-        },
+        actor,
         client,
       )
       const processed = await this.events.markProcessed(
         inserted.event.id,
         'processed',
         reasonCode,
-        this.clock(),
+        receivedAt,
+        receivedAt,
         client,
       )
       await this.appendEventAudit(
@@ -315,6 +375,41 @@ export class ProcessKycProviderEventService {
         reasonCode,
       }
     })
+    if ('postCommitError' in outcome) throw outcome.postCommitError
+    return outcome
+  }
+
+  private async rejectEvent(
+    event: StoredKycProviderEvent,
+    reasonCode: string,
+    playerId: string | null,
+    actor: KycActorContext,
+    processedAt: Date,
+    executor: QueryExecutor,
+  ): Promise<ProcessKycProviderEventResult> {
+    const rejected = await this.events.markProcessed(
+      event.id,
+      'rejected',
+      reasonCode,
+      processedAt,
+      null,
+      executor,
+    )
+    await this.appendEventAudit(
+      'kyc.event_rejected',
+      'rejected',
+      reasonCode,
+      rejected,
+      playerId,
+      actor,
+      executor,
+    )
+    return {
+      eventId: rejected.id,
+      processingStatus: rejected.processingStatus,
+      resultingKycStatus: null,
+      reasonCode: rejected.processingReasonCode,
+    }
   }
 
   private async ignoreStale(
@@ -322,13 +417,15 @@ export class ProcessKycProviderEventService {
     profile: KycProfile,
     session: KycSession,
     actor: KycActorContext,
+    processedAt: Date,
     executor: QueryExecutor,
   ): Promise<ProcessKycProviderEventResult> {
     const ignored = await this.events.markProcessed(
       event.id,
       'ignored_stale',
       'KYC_EVENT_STALE',
-      this.clock(),
+      processedAt,
+      null,
       executor,
     )
     await this.appendEventAudit(
@@ -346,6 +443,44 @@ export class ProcessKycProviderEventService {
       processingStatus: 'ignored_stale',
       resultingKycStatus: profile.status,
       reasonCode: 'KYC_EVENT_STALE',
+    }
+  }
+
+  private async ignoreExpired(
+    event: StoredKycProviderEvent,
+    profile: KycProfile,
+    session: KycSession,
+    actor: KycActorContext,
+    processedAt: Date,
+    executor: QueryExecutor,
+  ): Promise<ProcessKycProviderEventResult> {
+    const reasonCode = 'KYC_PROVIDER_EVENT_SESSION_EXPIRED'
+    const ignored = await this.events.markProcessed(
+      event.id,
+      'ignored_expired',
+      reasonCode,
+      processedAt,
+      null,
+      executor,
+    )
+    await this.appendEventAudit(
+      'kyc.event_ignored_expired_session',
+      'ignored',
+      reasonCode,
+      ignored,
+      profile.playerId,
+      actor,
+      executor,
+      {
+        sessionId: session.id,
+        sessionExpiresAt: session.expiresAt?.toISOString() ?? null,
+      },
+    )
+    return {
+      eventId: ignored.id,
+      processingStatus: 'ignored_expired',
+      resultingKycStatus: profile.status,
+      reasonCode,
     }
   }
 

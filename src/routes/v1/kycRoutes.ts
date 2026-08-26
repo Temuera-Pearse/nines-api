@@ -51,7 +51,7 @@ export function createKycRouter(dependencies: KycRouteDependencies): Router {
         .execute(requireIdentity(request), { correlationId: context.correlationId })
         .then(({ player }) =>
           dependencies.getKycProfile.execute(player.id, {
-            actorType: 'external_identity',
+            actorType: 'PLAYER',
             actorId: request.identity!.subject,
             correlationId: context.correlationId,
           }),
@@ -78,7 +78,7 @@ export function createKycRouter(dependencies: KycRouteDependencies): Router {
           dependencies.startKycVerification.execute(
             { playerId: player.id, idempotencyKey: key },
             {
-              actorType: 'external_identity',
+              actorType: 'PLAYER',
               actorId: request.identity!.subject,
               correlationId: context.correlationId,
             },

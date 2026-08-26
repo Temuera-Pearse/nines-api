@@ -1,7 +1,6 @@
 # nines-api roadmap
 
-This roadmap records the boundary of the Phase 1–3.5 checkpoint. It is not an
-authorization to begin Phase 4 work as part of the checkpoint commit.
+This roadmap records the boundary of the Phase 1–4 checkpoint.
 
 ## Phase 1 — player identity and API foundation
 
@@ -44,9 +43,9 @@ Status: complete.
 
 A scheduler and real provider are not part of Phase 3.
 
-## Phase 3.5 — mock end-to-end KYC integration
+## Phase 3.5 — end-to-end integration and lifecycle hardening
 
-Status: complete for local development and automated integration testing.
+Status: complete.
 
 - Return a hosted mock verification URL from fake-provider sessions.
 - Serve a standalone Pass/Fail/Cancel page only when explicitly enabled
@@ -59,6 +58,19 @@ Status: complete for local development and automated integration testing.
   popup lifecycle, narrow completion message, and authoritative refresh flow.
 - Keep access tokens out of the popup and prevent the mock routes from being
   enabled in production.
+- Enforce every status change through one transition service and a deferred
+  database transition guard.
+- Protect provider callbacks with database idempotency, ordering, ownership,
+  durable identity-collision audits, locked expiry enforcement, bounded clock
+  skew, and row locking.
+- Require the internal session UUID as the provider creation idempotency key and
+  replay failed client keys with a stable safe response.
+- Persist controlled manual reviews and immutable review actions; expose only
+  authenticated internal service methods until admin middleware exists.
+- Run independent bounded concurrent-safe session/profile expiry batches and
+  expire overdue approvals at request time before eligibility projection.
+- Project `/v1/me` permissions from one consistent eligibility snapshot and one
+  database transaction.
 
 The fake provider performs no real document, biometric, liveness, sanctions,
 identity, or manual-review work. It has no production webhook authentication,
@@ -77,20 +89,31 @@ runner reads only direct SQL files from `db/migrations` and does not recurse
 into the historical directory. Active runtime code imports neither source nor
 historical documentation.
 
-## Phase 4 — deferred
+## Phase 4 — provider-neutral crypto funding
 
-Status: not started.
+Status: complete.
 
-Candidate work, subject to a separate design and authorization:
+- Create owner-scoped external funding intents after existing deposit
+  eligibility succeeds.
+- Enforce HTTP idempotency in PostgreSQL and use the immutable internal intent
+  UUID for mandatory provider-side idempotency.
+- Separate provider calls from short intent preparation/activation
+  transactions.
+- Normalize and authenticate callbacks behind `CryptoFundingProvider` with
+  event identity, ordering, clock-skew, ownership, expiry, and row-lock rules.
+- Distinguish payment detection and confirmation from final confirmation.
+- Persist immutable lifecycle transitions, audits, processing outcomes, and
+  discrepancy/reconciliation records.
+- Produce exactly one durable `FinancialFundingInstruction` outbox row on
+  confirmation without changing an internal balance.
+- Run a bounded concurrent-safe funding-intent expiry worker.
+- Supply a deterministic development/test fake provider. No real crypto or
+  custody operation is performed.
 
-1. Production KYC provider adapter and authenticated webhook ingress.
-2. Operator authentication, account-state and restriction APIs, and
-   manual-review workflow.
-3. Scheduled KYC and restriction expiry workers.
-4. Downstream eligibility enforcement contracts.
-5. Rate limiting, security headers, metrics, tracing, alerting, and audit
-   retention.
-6. Jurisdiction, responsible-gambling, notification, and security providers.
+See `docs/PHASE_4_CRYPTO_FUNDING.md` for the complete boundary and adapter
+contract.
 
-Payments, wallets, ledgers, wagering, settlement, and race authority remain in
-their respective services and are not part of this roadmap checkpoint.
+Production KYC/crypto providers, operator APIs, restriction scheduling,
+financial outbox delivery, balances, ledger, conversion, custody, withdrawals,
+rate limiting, fraud/AML systems, wagering, settlement, and race authority
+remain deferred. Phase 5 has not begun.

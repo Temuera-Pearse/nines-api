@@ -54,6 +54,11 @@ export interface KycSessionRepository {
     at: Date,
     executor: QueryExecutor,
   ): Promise<KycSession | null>
+  expireIfDue(
+    sessionId: string,
+    at: Date,
+    executor: QueryExecutor,
+  ): Promise<KycSession | null>
   findByProviderReferenceForUpdate(
     provider: string,
     providerSessionReference: string,
@@ -63,5 +68,9 @@ export interface KycSessionRepository {
     input: UpdateKycSessionFromEventInput,
     executor: QueryExecutor,
   ): Promise<KycSession | null>
-  findExpiredPending(at: Date, executor: QueryExecutor): Promise<KycSession[]>
+  findExpiredPending(
+    at: Date,
+    limit: number,
+    executor: QueryExecutor,
+  ): Promise<KycSession[]>
 }

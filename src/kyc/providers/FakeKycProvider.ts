@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import {
   KYC_EVENT_RESULT_STATUSES,
+  normalizeKycProviderEventMetadata,
   type KycEventResultStatus,
   type NormalizedKycProviderEvent,
 } from '../domain/KycProviderEvent.js'
@@ -14,6 +15,7 @@ import {
 
 interface FakeEventPayload {
   provider?: string
+  playerId?: string
   providerEventId: string
   providerSessionReference: string
   eventType: string
@@ -43,8 +45,13 @@ function nonBlank(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+function safeReasonCode(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+}
+
 export class FakeKycProvider implements KycProvider {
   readonly providerName = 'fake'
+  private readonly createdSessions = new Map<string, CreateKycSessionResult>()
 
   constructor(
     private readonly sessionTtlMs: number,
@@ -55,8 +62,13 @@ export class FakeKycProvider implements KycProvider {
   async createVerificationSession(
     input: CreateKycSessionInput,
   ): Promise<CreateKycSessionResult> {
+    if (input.idempotencyKey !== input.internalSessionId) {
+      throw new Error('Fake KYC provider requires the internal session ID as its idempotency key')
+    }
+    const existing = this.createdSessions.get(input.idempotencyKey)
+    if (existing) return existing
     const expiresAt = new Date(this.clock().getTime() + this.sessionTtlMs)
-    return {
+    const created = {
       provider: this.providerName,
       providerSessionReference: `fake-session-${input.internalSessionId}`,
       verificationUrl: this.hostedBaseUrl
@@ -64,6 +76,8 @@ export class FakeKycProvider implements KycProvider {
         : null,
       expiresAt,
     }
+    this.createdSessions.set(input.idempotencyKey, created)
+    return created
   }
 
   async verifyAndNormalizeEvent(
@@ -74,7 +88,6 @@ export class FakeKycProvider implements KycProvider {
     }
     const payload = input.payload as Partial<FakeEventPayload>
     if (
-      (payload.provider !== undefined && payload.provider !== this.providerName) ||
       !nonBlank(payload.providerEventId) ||
       !nonBlank(payload.providerSessionReference) ||
       !nonBlank(payload.eventType) ||
@@ -85,25 +98,30 @@ export class FakeKycProvider implements KycProvider {
     ) {
       throw new KycProviderInputError('Fake KYC event structure is invalid')
     }
+    if (payload.provider !== undefined && payload.provider !== this.providerName) {
+      throw new KycProviderInputError(
+        'Fake KYC event provider does not match the adapter',
+        'KYC_PROVIDER_MISMATCH',
+      )
+    }
+    if (payload.eventType !== `verification.${payload.resultingStatus}`) {
+      throw new KycProviderInputError('Fake KYC event type is unsupported')
+    }
     const occurredAt = new Date(payload.occurredAt)
     if (Number.isNaN(occurredAt.getTime())) {
       throw new KycProviderInputError('Fake KYC event timestamp is invalid')
     }
-    const metadata =
-      payload.metadata &&
-      typeof payload.metadata === 'object' &&
-      !Array.isArray(payload.metadata)
-        ? payload.metadata
-        : {}
+    const metadata = normalizeKycProviderEventMetadata(payload.metadata)
 
     return {
       provider: this.providerName,
       providerEventId: payload.providerEventId,
       providerSessionReference: payload.providerSessionReference,
+      claimedPlayerReference: nonBlank(payload.playerId) ? payload.playerId : null,
       eventType: payload.eventType,
       resultingStatus: payload.resultingStatus as KycEventResultStatus,
       occurredAt,
-      reasonCode: nonBlank(payload.reasonCode) ? payload.reasonCode : null,
+      reasonCode: safeReasonCode(payload.reasonCode) ? payload.reasonCode : null,
       payloadHash: deterministicPayloadHash(input.payload),
       metadata,
     }
@@ -115,12 +133,14 @@ export class FakeKycProvider implements KycProvider {
     resultingStatus: KycEventResultStatus
     occurredAt: Date
     reasonCode?: string | null
+    claimedPlayerReference?: string | null
     metadata?: Record<string, unknown>
   }): FakeEventPayload {
     return {
       provider: this.providerName,
       providerEventId: input.providerEventId,
       providerSessionReference: input.providerSessionReference,
+      playerId: input.claimedPlayerReference ?? undefined,
       eventType: `verification.${input.resultingStatus}`,
       resultingStatus: input.resultingStatus,
       occurredAt: input.occurredAt.toISOString(),

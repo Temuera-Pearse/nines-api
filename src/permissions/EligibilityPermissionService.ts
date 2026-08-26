@@ -26,18 +26,14 @@ export class EligibilityPermissionService implements PermissionService {
     player: Player,
     context: PermissionEvaluationContext,
   ): Promise<PlayerPermissionEvaluation> {
-    const evaluations = await Promise.all(
-      PERMISSION_OPERATIONS.map((operation) =>
-        this.eligibility.execute(
-          { player, operation },
-          {
-            actorType: 'external_identity',
-            actorId: context.actorId,
-            correlationId: context.correlationId,
-            purpose: 'permission_projection',
-          },
-        ),
-      ),
+    const evaluations = await this.eligibility.executeMany(
+      { player, operations: PERMISSION_OPERATIONS },
+      {
+        actorType: 'external_identity',
+        actorId: context.actorId,
+        correlationId: context.correlationId,
+        purpose: 'permission_projection',
+      },
     )
     const allowed = Object.fromEntries(
       evaluations.map((decision) => [decision.operation, decision.allowed]),

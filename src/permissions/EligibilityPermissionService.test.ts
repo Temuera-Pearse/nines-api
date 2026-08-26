@@ -17,22 +17,24 @@ const player: Player = {
 
 describe('eligibility permission calculation', () => {
   it('derives every permission from typed eligibility evaluations', async () => {
-    const execute = vi.fn(async ({ operation }: { operation: PlayerOperation }) => ({
-      decisionId: `decision-${operation}`,
-      playerId: player.id,
-      operation,
-      allowed: operation !== 'withdraw',
-      reasonCodes: operation === 'withdraw' ? ['WITHDRAWALS_BLOCKED' as const] : [],
-      policyVersion: ELIGIBILITY_POLICY_VERSION,
-      evaluatedAt: new Date('2026-01-01T00:00:00Z'),
-      inputSnapshot: {
-        accountStatus: 'active',
-        kycStatus: 'verified',
-        activeRestrictionTypes: [],
-      },
-    }))
+    const executeMany = vi.fn(async ({ operations }: { operations: readonly PlayerOperation[] }) =>
+      operations.map((operation) => ({
+        decisionId: `decision-${operation}`,
+        playerId: player.id,
+        operation,
+        allowed: operation !== 'withdraw',
+        reasonCodes: operation === 'withdraw' ? ['WITHDRAWALS_BLOCKED' as const] : [],
+        policyVersion: ELIGIBILITY_POLICY_VERSION,
+        evaluatedAt: new Date('2026-01-01T00:00:00Z'),
+        inputSnapshot: {
+          accountStatus: 'active' as const,
+          kycStatus: 'verified' as const,
+          activeRestrictionTypes: [],
+        },
+      })),
+    )
     const service = new EligibilityPermissionService(
-      { execute } as unknown as EvaluateEligibilityService,
+      { executeMany } as unknown as EvaluateEligibilityService,
     )
 
     await expect(
@@ -49,8 +51,8 @@ describe('eligibility permission calculation', () => {
         manageProfile: true,
       },
     })
-    expect(execute).toHaveBeenCalledTimes(6)
-    expect(execute.mock.calls.map(([input]) => input.operation)).toEqual([
+    expect(executeMany).toHaveBeenCalledTimes(1)
+    expect(executeMany.mock.calls[0]?.[0].operations).toEqual([
       'view_races',
       'deposit',
       'withdraw',

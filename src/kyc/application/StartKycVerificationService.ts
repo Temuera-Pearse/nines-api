@@ -5,15 +5,13 @@ import type { EvaluateEligibilityService } from '../../eligibility/application/E
 import type { PlayerRepository } from '../../players/infrastructure/PlayerRepository.js'
 import { withTransaction } from '../../shared/db/transaction.js'
 import { AppError } from '../../shared/http/AppError.js'
-import { canTransitionKycStatus } from '../domain/KycTransition.js'
-import type { KycProfile } from '../domain/KycProfile.js'
 import type { KycSession } from '../domain/KycSession.js'
 import type { KycProfileRepository } from '../infrastructure/KycProfileRepository.js'
 import type { KycSessionRepository } from '../infrastructure/KycSessionRepository.js'
-import type { KycStatusTransitionRepository } from '../infrastructure/KycStatusTransitionRepository.js'
 import type { KycProvider } from '../providers/KycProvider.js'
 import type { KycActorContext } from './KycContext.js'
 import { getOrCreateKycProfile } from './profileCreation.js'
+import type { TransitionKycStatusService } from './TransitionKycStatusService.js'
 
 export interface StartKycVerificationInput {
   playerId: string
@@ -39,7 +37,7 @@ export class StartKycVerificationService {
     private readonly players: PlayerRepository,
     private readonly profiles: KycProfileRepository,
     private readonly sessions: KycSessionRepository,
-    private readonly transitions: KycStatusTransitionRepository,
+    private readonly transitionKycStatus: TransitionKycStatusService,
     private readonly audit: AuditRepository,
     private readonly eligibility: EvaluateEligibilityService,
     private readonly provider: KycProvider,
@@ -73,6 +71,9 @@ export class StartKycVerificationService {
 
     const intent = await this.prepareIntent(input, actor)
     if (!intent.needsProviderCall) {
+      if (intent.session.status === 'creation_failed') {
+        throw this.providerCreationError()
+      }
       await this.auditReused(intent.session, actor)
       return this.safeResult(intent.session)
     }
@@ -82,6 +83,7 @@ export class StartKycVerificationService {
       providerResult = await this.provider.createVerificationSession({
         playerId: input.playerId,
         internalSessionId: intent.session.id,
+        idempotencyKey: intent.session.id,
         correlationId: actor.correlationId,
       })
       if (
@@ -94,13 +96,7 @@ export class StartKycVerificationService {
     } catch (cause) {
       const racedSession = await this.markProviderFailure(intent.session.id, actor)
       if (racedSession?.status === 'pending') return this.safeResult(racedSession)
-      throw new AppError({
-        status: 503,
-        code: 'KYC_SESSION_CREATION_FAILED',
-        message: 'KYC provider session creation failed',
-        publicMessage: 'KYC verification is temporarily unavailable',
-        cause,
-      })
+      throw this.providerCreationError(cause)
     }
 
     return withTransaction(this.pool, async (client) => {
@@ -116,14 +112,6 @@ export class StartKycVerificationService {
       }
       const profile = await this.profiles.getForUpdate(input.playerId, client)
       if (!profile) throw new Error('KYC profile was not found')
-      if (!canTransitionKycStatus(profile.status, 'pending')) {
-        throw new AppError({
-          status: 409,
-          code: 'KYC_TRANSITION_INVALID',
-          message: `Cannot transition KYC from ${profile.status} to pending`,
-          publicMessage: 'KYC state changed while starting verification',
-        })
-      }
       const session = await this.sessions.activate(
         {
           sessionId: lockedSession.id,
@@ -134,27 +122,22 @@ export class StartKycVerificationService {
         client,
       )
       if (!session) throw new Error('KYC session activation failed')
-      const updatedProfile = await this.profiles.updateStatus(
+      await this.transitionKycStatus.execute(
         {
-          profileId: profile.id,
-          expectedVersion: profile.version,
-          status: 'pending',
+          playerId: input.playerId,
+          toStatus: 'pending',
+          trigger: 'SESSION_STARTED',
+          reasonCode: 'KYC_SESSION_STARTED',
           provider: session.provider,
-          currentSessionId: session.id,
+          sessionId: session.id,
           verifiedAt: profile.verifiedAt,
           expiresAt: null,
           failureReasonCode: null,
+          metadata: { attemptNumber: session.attemptNumber },
         },
+        actor,
         client,
       )
-      if (!updatedProfile) {
-        throw new AppError({
-          status: 409,
-          code: 'KYC_STATE_CONFLICT',
-          message: 'KYC profile version conflict',
-        })
-      }
-      await this.appendTransition(profile, updatedProfile, session, actor, client)
       await this.audit.append(
         {
           id: randomUUID(),
@@ -191,8 +174,19 @@ export class StartKycVerificationService {
         this.audit,
         client,
       )
+      await this.transitionKycStatus.expireIfDue(input.playerId, actor, client)
       const profile = await this.profiles.getForUpdate(input.playerId, client)
       if (!profile) throw new Error('KYC profile was not found')
+      const idempotent = input.idempotencyKey
+        ? await this.sessions.findByIdempotencyKey(
+            input.playerId,
+            input.idempotencyKey,
+            client,
+          )
+        : null
+      if (idempotent?.status === 'creation_failed') {
+        return { session: idempotent, needsProviderCall: false }
+      }
       if (
         profile.status === 'verified' &&
         (profile.expiresAt === null || profile.expiresAt.getTime() > at.getTime())
@@ -203,15 +197,8 @@ export class StartKycVerificationService {
           message: 'Player KYC is already verified',
         })
       }
-      if (input.idempotencyKey) {
-        const idempotent = await this.sessions.findByIdempotencyKey(
-          input.playerId,
-          input.idempotencyKey,
-          client,
-        )
-        if (idempotent) {
-          return { session: idempotent, needsProviderCall: idempotent.status === 'creating' }
-        }
+      if (idempotent) {
+        return { session: idempotent, needsProviderCall: idempotent.status === 'creating' }
       }
       const effective = await this.sessions.getCurrentEffective(input.playerId, at, client)
       if (effective) {
@@ -282,7 +269,7 @@ export class StartKycVerificationService {
           playerId: failed.playerId,
           action: 'kyc.session_failed',
           outcome: 'failure',
-          reasonCode: 'KYC_EVENT_INVALID',
+          reasonCode: 'KYC_SESSION_CREATION_FAILED',
           correlationId: actor.correlationId,
           metadata: { sessionId: failed.id, provider: failed.provider },
         },
@@ -290,49 +277,6 @@ export class StartKycVerificationService {
       )
       return failed
     })
-  }
-
-  private async appendTransition(
-    before: KycProfile,
-    after: KycProfile,
-    session: KycSession,
-    actor: KycActorContext,
-    executor: Parameters<AuditRepository['append']>[1],
-  ): Promise<void> {
-    await this.transitions.append(
-      {
-        id: randomUUID(),
-        playerId: before.playerId,
-        sessionId: session.id,
-        fromStatus: before.status,
-        toStatus: after.status,
-        reasonCode: 'KYC_SESSION_STARTED',
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        providerEventId: null,
-        correlationId: actor.correlationId,
-        metadata: { attemptNumber: session.attemptNumber, provider: session.provider },
-      },
-      executor,
-    )
-    await this.audit.append(
-      {
-        id: randomUUID(),
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        playerId: before.playerId,
-        action: 'kyc.status_changed',
-        outcome: 'success',
-        reasonCode: 'KYC_SESSION_STARTED',
-        correlationId: actor.correlationId,
-        metadata: {
-          sessionId: session.id,
-          fromStatus: before.status,
-          toStatus: after.status,
-        },
-      },
-      executor,
-    )
   }
 
   private async auditReused(
@@ -367,5 +311,15 @@ export class StartKycVerificationService {
       verificationUrl: session.verificationUrl,
       expiresAt: session.expiresAt,
     }
+  }
+
+  private providerCreationError(cause?: unknown): AppError {
+    return new AppError({
+      status: 503,
+      code: 'KYC_SESSION_CREATION_FAILED',
+      message: 'KYC provider session creation failed',
+      publicMessage: 'KYC verification is temporarily unavailable',
+      cause,
+    })
   }
 }

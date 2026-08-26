@@ -28,6 +28,7 @@ export interface KycProviderEventRepository {
     status: Exclude<KycEventProcessingStatus, 'received'>,
     reasonCode: string | null,
     processedAt: Date,
+    acceptedAt: Date | null,
     executor: QueryExecutor,
   ): Promise<StoredKycProviderEvent>
 }

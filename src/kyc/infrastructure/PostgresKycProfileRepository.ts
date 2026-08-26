@@ -121,6 +121,7 @@ export class PostgresKycProfileRepository implements KycProfileRepository {
 
   async findExpiredVerified(
     at: Date,
+    limit: number,
     executor: QueryExecutor,
   ): Promise<KycProfile[]> {
     const result = await executor.query<KycProfileRow>(
@@ -130,8 +131,9 @@ export class PostgresKycProfileRepository implements KycProfileRepository {
          AND expires_at IS NOT NULL
          AND expires_at <= $1
        ORDER BY expires_at, id
+       LIMIT $2
        FOR UPDATE SKIP LOCKED`,
-      [at],
+      [at, limit],
     )
     return result.rows.map(mapProfile)
   }

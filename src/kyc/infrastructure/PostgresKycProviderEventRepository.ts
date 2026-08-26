@@ -1,12 +1,13 @@
 import type { QueryResultRow } from 'pg'
-import { sanitizeAuditMetadata } from '../../audit/metadata.js'
 import type { QueryExecutor } from '../../shared/db/transaction.js'
 import type {
   KycEventProcessingStatus,
   KycEventResultStatus,
+  KycProviderEventMetadata,
   NormalizedKycProviderEvent,
   StoredKycProviderEvent,
 } from '../domain/KycProviderEvent.js'
+import { assertKycProviderEventMetadata } from '../domain/KycProviderEvent.js'
 import type {
   InsertKycProviderEventResult,
   KycProviderEventRepository,
@@ -17,6 +18,7 @@ interface KycProviderEventRow extends QueryResultRow {
   provider: string
   provider_event_id: string
   provider_session_reference: string
+  claimed_player_reference: string | null
   event_type: string
   normalized_status: KycEventResultStatus
   event_timestamp: Date
@@ -25,14 +27,15 @@ interface KycProviderEventRow extends QueryResultRow {
   processing_reason_code: string | null
   correlation_id: string
   received_at: Date
+  accepted_at: Date | null
   processed_at: Date | null
-  metadata: Record<string, unknown>
+  metadata: KycProviderEventMetadata
 }
 
 const EVENT_COLUMNS = `
   id, provider, provider_event_id, provider_session_reference, event_type,
-  normalized_status, event_timestamp, payload_hash, processing_status,
-  processing_reason_code, correlation_id, received_at, processed_at, metadata
+  claimed_player_reference, normalized_status, event_timestamp, payload_hash, processing_status,
+  processing_reason_code, correlation_id, received_at, accepted_at, processed_at, metadata
 `
 
 function mapEvent(row: KycProviderEventRow): StoredKycProviderEvent {
@@ -41,6 +44,7 @@ function mapEvent(row: KycProviderEventRow): StoredKycProviderEvent {
     provider: row.provider,
     providerEventId: row.provider_event_id,
     providerSessionReference: row.provider_session_reference,
+    claimedPlayerReference: row.claimed_player_reference,
     eventType: row.event_type,
     resultingStatus: row.normalized_status,
     occurredAt: row.event_timestamp,
@@ -49,6 +53,7 @@ function mapEvent(row: KycProviderEventRow): StoredKycProviderEvent {
     processingReasonCode: row.processing_reason_code,
     correlationId: row.correlation_id,
     receivedAt: row.received_at,
+    acceptedAt: row.accepted_at,
     processedAt: row.processed_at,
     reasonCode: null,
     metadata: row.metadata,
@@ -79,12 +84,13 @@ export class PostgresKycProviderEventRepository
     receivedAt: Date,
     executor: QueryExecutor,
   ): Promise<InsertKycProviderEventResult> {
+    assertKycProviderEventMetadata(event.metadata)
     const inserted = await executor.query<KycProviderEventRow>(
       `INSERT INTO kyc_provider_events
         (id, provider, provider_event_id, provider_session_reference, event_type,
-         normalized_status, event_timestamp, payload_hash, correlation_id,
-         received_at, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+         claimed_player_reference, normalized_status, event_timestamp, payload_hash,
+         correlation_id, received_at, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
        ON CONFLICT (provider, provider_event_id) DO NOTHING
        RETURNING ${EVENT_COLUMNS}`,
       [
@@ -93,12 +99,13 @@ export class PostgresKycProviderEventRepository
         event.providerEventId,
         event.providerSessionReference,
         event.eventType,
+        event.claimedPlayerReference,
         event.resultingStatus,
         event.occurredAt,
         event.payloadHash,
         correlationId,
         receivedAt,
-        JSON.stringify(sanitizeAuditMetadata(event.metadata)),
+        JSON.stringify(event.metadata),
       ],
     )
     if (inserted.rows[0]) return { event: mapEvent(inserted.rows[0]), created: true }
@@ -112,16 +119,18 @@ export class PostgresKycProviderEventRepository
     status: Exclude<KycEventProcessingStatus, 'received'>,
     reasonCode: string | null,
     processedAt: Date,
+    acceptedAt: Date | null,
     executor: QueryExecutor,
   ): Promise<StoredKycProviderEvent> {
     const result = await executor.query<KycProviderEventRow>(
       `UPDATE kyc_provider_events
        SET processing_status = $2,
            processing_reason_code = $3,
-           processed_at = $4
+           processed_at = $4,
+           accepted_at = $5
        WHERE id = $1
        RETURNING ${EVENT_COLUMNS}`,
-      [eventId, status, reasonCode, processedAt],
+      [eventId, status, reasonCode, processedAt, acceptedAt],
     )
     if (!result.rows[0]) throw new Error('KYC provider event was not found')
     return mapEvent(result.rows[0])

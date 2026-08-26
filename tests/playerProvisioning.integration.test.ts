@@ -10,7 +10,11 @@ import { PostgresAuthenticationIdentityRepository } from '../src/players/infrast
 import { PostgresPlayerRepository } from '../src/players/infrastructure/PostgresPlayerRepository.js'
 import { runMigrations } from '../src/shared/db/migrations.js'
 import { createSilentLogger } from '../src/shared/observability/logger.js'
-import { createTestPool, resetAndMigrateTestDatabase, truncatePhase1Tables } from './support/database.js'
+import {
+  createTestPool,
+  resetAndMigrateTestDatabase,
+  truncatePhase1Tables,
+} from './support/database.js'
 
 let pool: Pool
 
@@ -81,19 +85,27 @@ describe('database migrations', () => {
   })
 
   it('does not reapply an already applied migration', async () => {
-    const result = await runMigrations(pool, path.resolve(process.cwd(), 'db/migrations'))
+    const result = await runMigrations(
+      pool,
+      path.resolve(process.cwd(), 'db/migrations'),
+    )
     expect(result.applied).toEqual([])
     expect(result.alreadyApplied).toEqual([
       '001_phase_1_player_identity.sql',
       '002_phase_2_eligibility.sql',
       '003_phase_3_kyc.sql',
+      '004_phase_3_5_kyc_lifecycle_hardening.sql',
+      '005_phase_4_crypto_funding.sql',
     ])
   })
 
   it('enforces identity uniqueness and restricted account defaults', async () => {
     const playerId = randomUUID()
     await pool.query('INSERT INTO players (id) VALUES ($1)', [playerId])
-    const player = await pool.query('SELECT account_status FROM players WHERE id = $1', [playerId])
+    const player = await pool.query(
+      'SELECT account_status FROM players WHERE id = $1',
+      [playerId],
+    )
     expect(player.rows[0].account_status).toBe('restricted')
 
     await pool.query(
@@ -113,38 +125,62 @@ describe('database migrations', () => {
 
 describe('transactional player provisioning', () => {
   it('creates a restricted player, identity, and audit event on first login', async () => {
-    const result = await service().execute(baseIdentity, { correlationId: 'corr-first' })
+    const result = await service().execute(baseIdentity, {
+      correlationId: 'corr-first',
+    })
     expect(result.created).toBe(true)
     expect(result.player).toMatchObject({
       email: 'first@example.com',
       displayName: 'First Player',
       accountStatus: 'restricted',
     })
-    const audit = await pool.query('SELECT action, correlation_id FROM audit_events')
-    expect(audit.rows).toEqual([{ action: 'player.provisioned', correlation_id: 'corr-first' }])
+    const audit = await pool.query(
+      'SELECT action, correlation_id FROM audit_events',
+    )
+    expect(audit.rows).toEqual([
+      { action: 'player.provisioned', correlation_id: 'corr-first' },
+    ])
   })
 
   it('returns the same player on repeat and concurrent first login', async () => {
-    const repeated = await service().execute(baseIdentity, { correlationId: 'corr-1' })
-    const repeat = await service().execute(baseIdentity, { correlationId: 'corr-2' })
+    const repeated = await service().execute(baseIdentity, {
+      correlationId: 'corr-1',
+    })
+    const repeat = await service().execute(baseIdentity, {
+      correlationId: 'corr-2',
+    })
     expect(repeat.created).toBe(false)
     expect(repeat.player.id).toBe(repeated.player.id)
 
     await truncatePhase1Tables(pool)
     const concurrent = await Promise.all(
       Array.from({ length: 8 }, (_, index) =>
-        service().execute(baseIdentity, { correlationId: `corr-concurrent-${index}` }),
+        service().execute(baseIdentity, {
+          correlationId: `corr-concurrent-${index}`,
+        }),
       ),
     )
     expect(new Set(concurrent.map((entry) => entry.player.id)).size).toBe(1)
-    expect((await pool.query('SELECT COUNT(*)::int AS count FROM players')).rows[0].count).toBe(1)
-    expect((await pool.query('SELECT COUNT(*)::int AS count FROM audit_events')).rows[0].count).toBe(1)
+    expect(
+      (await pool.query('SELECT COUNT(*)::int AS count FROM players')).rows[0]
+        .count,
+    ).toBe(1)
+    expect(
+      (await pool.query('SELECT COUNT(*)::int AS count FROM audit_events'))
+        .rows[0].count,
+    ).toBe(1)
   })
 
   it('updates mutable profile fields without changing status or identity', async () => {
-    const first = await service().execute(baseIdentity, { correlationId: 'corr-1' })
+    const first = await service().execute(baseIdentity, {
+      correlationId: 'corr-1',
+    })
     const changed = await service().execute(
-      { ...baseIdentity, email: 'changed@example.com', displayName: 'Changed Name' },
+      {
+        ...baseIdentity,
+        email: 'changed@example.com',
+        displayName: 'Changed Name',
+      },
       { correlationId: 'corr-2' },
     )
     expect(changed.player).toMatchObject({
@@ -163,7 +199,9 @@ describe('transactional player provisioning', () => {
     )
     expect(withoutEmail.player.email).toBeNull()
 
-    const sameEmailA = await service().execute(baseIdentity, { correlationId: 'corr-2' })
+    const sameEmailA = await service().execute(baseIdentity, {
+      correlationId: 'corr-2',
+    })
     const sameEmailB = await service().execute(
       { ...baseIdentity, subject: 'google-oauth2|different-subject' },
       { correlationId: 'corr-3' },
@@ -178,12 +216,20 @@ describe('transactional player provisioning', () => {
       },
     }
     await expect(
-      service(failingAudit).execute(baseIdentity, { correlationId: 'corr-fail' }),
+      service(failingAudit).execute(baseIdentity, {
+        correlationId: 'corr-fail',
+      }),
     ).rejects.toMatchObject({ code: 'PLAYER_STORE_UNAVAILABLE' })
-    expect((await pool.query('SELECT COUNT(*)::int AS count FROM players')).rows[0].count).toBe(0)
     expect(
-      (await pool.query('SELECT COUNT(*)::int AS count FROM authentication_identities')).rows[0]
+      (await pool.query('SELECT COUNT(*)::int AS count FROM players')).rows[0]
         .count,
+    ).toBe(0)
+    expect(
+      (
+        await pool.query(
+          'SELECT COUNT(*)::int AS count FROM authentication_identities',
+        )
+      ).rows[0].count,
     ).toBe(0)
   })
 

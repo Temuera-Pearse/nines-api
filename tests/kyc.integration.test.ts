@@ -9,8 +9,11 @@ import { PostgresEligibilityDecisionRepository } from '../src/eligibility/infras
 import { PostgresRestrictionRepository } from '../src/eligibility/infrastructure/PostgresRestrictionRepository.js'
 import { ExpireKycSessionsService } from '../src/kyc/application/ExpireKycSessionsService.js'
 import { GetKycProfileService } from '../src/kyc/application/GetKycProfileService.js'
+import { KycManualReviewService } from '../src/kyc/application/KycManualReviewService.js'
 import { ProcessKycProviderEventService } from '../src/kyc/application/ProcessKycProviderEventService.js'
 import { StartKycVerificationService } from '../src/kyc/application/StartKycVerificationService.js'
+import { TransitionKycStatusService } from '../src/kyc/application/TransitionKycStatusService.js'
+import { PostgresKycManualReviewRepository } from '../src/kyc/infrastructure/PostgresKycManualReviewRepository.js'
 import { PostgresKycProfileRepository } from '../src/kyc/infrastructure/PostgresKycProfileRepository.js'
 import { PostgresKycProviderEventRepository } from '../src/kyc/infrastructure/PostgresKycProviderEventRepository.js'
 import { PostgresKycSessionRepository } from '../src/kyc/infrastructure/PostgresKycSessionRepository.js'
@@ -26,6 +29,7 @@ import { PostgresAccountStatusTransitionRepository } from '../src/players/infras
 import { PostgresAuthenticationIdentityRepository } from '../src/players/infrastructure/PostgresAuthenticationIdentityRepository.js'
 import { PostgresPlayerRepository } from '../src/players/infrastructure/PostgresPlayerRepository.js'
 import { createSilentLogger } from '../src/shared/observability/logger.js'
+import { withTransaction } from '../src/shared/db/transaction.js'
 import {
   createTestPool,
   resetAndMigrateTestDatabase,
@@ -43,6 +47,7 @@ const profiles = new PostgresKycProfileRepository()
 const sessions = new PostgresKycSessionRepository()
 const events = new PostgresKycProviderEventRepository()
 const transitions = new PostgresKycStatusTransitionRepository()
+const reviews = new PostgresKycManualReviewRepository()
 const restrictions = new PostgresRestrictionRepository()
 const logger = createSilentLogger()
 
@@ -57,7 +62,7 @@ const identity: AuthenticatedIdentity = {
 }
 
 const actor = (correlationId: string) => ({
-  actorType: 'test_operator',
+  actorType: 'ADMIN' as const,
   actorId: 'operator-1',
   correlationId,
 })
@@ -76,31 +81,54 @@ function resolver() {
   )
 }
 
-function eligibility() {
+function eligibility(databasePool: Pool = pool) {
   return new EvaluateEligibilityService(
-    pool,
+    databasePool,
     restrictions,
     new PostgresEligibilityDecisionRepository(),
     audit,
-    new PostgresKycStatusReader(pool, profiles, audit),
+    new PostgresKycStatusReader(
+      databasePool,
+      profiles,
+      audit,
+      transitionService(),
+      () => now,
+    ),
     () => now,
   )
 }
 
 function getProfile() {
-  return new GetKycProfileService(pool, players, profiles, sessions, audit)
+  return new GetKycProfileService(
+    pool,
+    players,
+    profiles,
+    sessions,
+    audit,
+    transitionService(),
+  )
 }
 
-function startService() {
+function transitionService() {
+  return new TransitionKycStatusService(
+    profiles,
+    transitions,
+    reviews,
+    audit,
+    () => now,
+  )
+}
+
+function startService(kycProvider: KycProvider = provider()) {
   return new StartKycVerificationService(
     pool,
     players,
     profiles,
     sessions,
-    transitions,
+    transitionService(),
     audit,
     eligibility(),
-    provider(),
+    kycProvider,
     () => now,
   )
 }
@@ -111,7 +139,7 @@ function eventService() {
     profiles,
     sessions,
     events,
-    transitions,
+    transitionService(),
     audit,
     provider(),
     VERIFICATION_TTL_MS,
@@ -120,14 +148,41 @@ function eventService() {
 }
 
 function expiryService() {
-  return new ExpireKycSessionsService(pool, profiles, sessions, transitions, audit)
+  return new ExpireKycSessionsService(
+    pool,
+    profiles,
+    sessions,
+    transitionService(),
+    audit,
+  )
+}
+
+function reviewService() {
+  return new KycManualReviewService(
+    pool,
+    reviews,
+    sessions,
+    transitionService(),
+    audit,
+    VERIFICATION_TTL_MS,
+    () => now,
+  )
 }
 
 async function createPlayer(): Promise<Player> {
   return (await resolver().execute(identity, { correlationId: 'corr-kyc-provision' })).player
 }
 
-async function start(player: Player, key = randomUUID()) {
+async function createPlayerWithSubject(subject: string): Promise<Player> {
+  return (
+    await resolver().execute(
+      { ...identity, subject, email: `${subject}@example.com` },
+      { correlationId: `corr-kyc-provision-${subject}` },
+    )
+  ).player
+}
+
+async function start(player: Player, key: string = randomUUID()) {
   return startService().execute(
     { playerId: player.id, idempotencyKey: key },
     actor(`corr-start-${key}`),
@@ -150,8 +205,22 @@ async function outcome(
         occurredAt,
       }),
     },
-    actor(`corr-event-${eventId}`),
+    {
+      actorType: 'PROVIDER',
+      actorId: 'fake',
+      correlationId: `corr-event-${eventId}`,
+    },
   )
+}
+
+async function activeReviewId(playerId: string): Promise<string> {
+  const result = await pool.query<{ id: string }>(
+    `SELECT id FROM kyc_manual_reviews
+     WHERE player_id = $1 AND status <> 'completed'`,
+    [playerId],
+  )
+  if (!result.rows[0]) throw new Error('Expected an active manual review')
+  return result.rows[0].id
 }
 
 beforeAll(async () => {
@@ -236,6 +305,39 @@ describe('KYC profile and session concurrency', () => {
     expect(transitionsCount.rows[0].count).toBe(1)
   })
 
+  it.each([2, 10])(
+    'creates one logical provider session for %i concurrent starts',
+    async (concurrency) => {
+      const player = await createPlayer()
+      const delegate = provider()
+      const logicalCreationKeys = new Set<string>()
+      let providerCalls = 0
+      const replaySafeProvider: KycProvider = {
+        providerName: delegate.providerName,
+        async createVerificationSession(input) {
+          providerCalls += 1
+          logicalCreationKeys.add(input.idempotencyKey)
+          return delegate.createVerificationSession(input)
+        },
+        verifyAndNormalizeEvent: (input) => delegate.verifyAndNormalizeEvent(input),
+      }
+      const service = startService(replaySafeProvider)
+      const results = await Promise.all(
+        Array.from({ length: concurrency }, (_, index) =>
+          service.execute(
+            { playerId: player.id, idempotencyKey: 'concurrent-provider-key' },
+            actor(`corr-concurrent-provider-${index}`),
+          ),
+        ),
+      )
+
+      expect(new Set(results.map((result) => result.sessionId)).size).toBe(1)
+      expect(new Set(results.map((result) => result.verificationUrl)).size).toBe(1)
+      expect(logicalCreationKeys).toEqual(new Set([results[0].sessionId]))
+      expect(providerCalls).toBeGreaterThanOrEqual(1)
+    },
+  )
+
   it('marks provider creation failure recoverably without changing profile state', async () => {
     const player = await createPlayer()
     const unavailableProvider: KycProvider = {
@@ -252,7 +354,7 @@ describe('KYC profile and session concurrency', () => {
       players,
       profiles,
       sessions,
-      transitions,
+      transitionService(),
       audit,
       eligibility(),
       unavailableProvider,
@@ -262,6 +364,16 @@ describe('KYC profile and session concurrency', () => {
       unavailable.execute(
         { playerId: player.id, idempotencyKey: 'provider-failure' },
         actor('corr-provider-failure'),
+      ),
+    ).rejects.toMatchObject({
+      code: 'KYC_SESSION_CREATION_FAILED',
+      status: 503,
+      publicMessage: 'KYC verification is temporarily unavailable',
+    })
+    await expect(
+      unavailable.execute(
+        { playerId: player.id, idempotencyKey: 'provider-failure' },
+        actor('corr-provider-failure-replay'),
       ),
     ).rejects.toMatchObject({
       code: 'KYC_SESSION_CREATION_FAILED',
@@ -279,6 +391,12 @@ describe('KYC profile and session concurrency', () => {
     await expect(start(player, 'provider-retry')).resolves.toMatchObject({
       status: 'pending',
     })
+    await expect(
+      unavailable.execute(
+        { playerId: player.id, idempotencyKey: 'provider-failure' },
+        actor('corr-provider-failure-after-new-attempt'),
+      ),
+    ).rejects.toMatchObject({ code: 'KYC_SESSION_CREATION_FAILED', status: 503 })
   })
 })
 
@@ -302,8 +420,8 @@ describe('provider event processing', () => {
     const profile = await getProfile().execute(player.id, actor('corr-read-verified'))
     expect(profile).toMatchObject({
       status: 'verified',
-      verifiedAt: new Date('2026-07-23T10:00:01Z'),
-      expiresAt: new Date('2026-07-24T10:00:01Z'),
+      verifiedAt: new Date('2026-07-23T10:00:00Z'),
+      expiresAt: new Date('2026-07-24T10:00:00Z'),
       currentSession: null,
     })
     expect(
@@ -314,6 +432,241 @@ describe('provider event processing', () => {
         )
       ).rows[0].count,
     ).toBe(1)
+  })
+
+  it.each([
+    ['exactly at', new Date('2026-07-23T11:00:00Z')],
+    ['after', new Date('2026-07-23T11:00:01Z')],
+  ])('expires a session and ignores a callback %s expiry', async (_label, callbackAt) => {
+    const player = await createPlayer()
+    const session = await start(player, `expired-callback-${_label}`)
+    now = callbackAt
+
+    const ignored = await outcome(
+      session.sessionId,
+      'verified',
+      `event-expired-${_label}`,
+      callbackAt,
+    )
+    expect(ignored).toMatchObject({
+      processingStatus: 'ignored_expired',
+      resultingKycStatus: 'expired',
+      reasonCode: 'KYC_PROVIDER_EVENT_SESSION_EXPIRED',
+    })
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('expired')
+    expect((await sessions.findById(session.sessionId, pool))?.status).toBe('expired')
+
+    const duplicate = await outcome(
+      session.sessionId,
+      'verified',
+      `event-expired-${_label}`,
+      callbackAt,
+    )
+    expect(duplicate).toMatchObject({
+      eventId: ignored.eventId,
+      processingStatus: 'ignored_duplicate',
+      reasonCode: 'KYC_EVENT_DUPLICATE',
+    })
+  })
+
+  it('serializes a due callback racing the expiry worker without allowing approval', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'callback-expiry-race')
+    now = new Date('2026-07-23T11:00:00Z')
+
+    const [callback, worker] = await Promise.all([
+      outcome(
+        session.sessionId,
+        'verified',
+        'event-callback-expiry-race',
+        now,
+      ),
+      expiryService().execute(now, {
+        actorType: 'SYSTEM',
+        actorId: 'race-worker',
+        correlationId: 'corr-callback-expiry-race-worker',
+      }),
+    ])
+
+    expect(callback).toMatchObject({
+      processingStatus: 'ignored_expired',
+      reasonCode: 'KYC_PROVIDER_EVENT_SESSION_EXPIRED',
+    })
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('expired')
+    expect((await sessions.findById(session.sessionId, pool))?.status).toBe('expired')
+    expect(worker.failures).toEqual([])
+    const approvals = await pool.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM kyc_status_transitions
+       WHERE player_id = $1 AND to_status = 'verified'`,
+      [player.id],
+    )
+    expect(approvals.rows[0].count).toBe(0)
+  })
+
+  it('bounds future provider timestamps and uses receipt time for verification TTL', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'timestamp-skew-key')
+    const insideSkew = new Date(now.getTime() + 5 * 60_000)
+    const accepted = await outcome(
+      session.sessionId,
+      'verified',
+      'event-inside-skew',
+      insideSkew,
+    )
+    expect(accepted.processingStatus).toBe('processed')
+    expect(await profiles.findForPlayer(player.id, pool)).toMatchObject({
+      status: 'verified',
+      verifiedAt: now,
+      expiresAt: new Date(now.getTime() + VERIFICATION_TTL_MS),
+    })
+    const acceptedEvent = await pool.query<{
+      event_timestamp: Date
+      received_at: Date
+      accepted_at: Date | null
+    }>(
+      `SELECT event_timestamp, received_at, accepted_at
+       FROM kyc_provider_events WHERE provider_event_id = 'event-inside-skew'`,
+    )
+    expect(acceptedEvent.rows[0]).toEqual({
+      event_timestamp: insideSkew,
+      received_at: now,
+      accepted_at: now,
+    })
+
+    const secondPlayer = await createPlayerWithSubject('auth0|future-skew-player')
+    const secondSession = await start(secondPlayer, 'timestamp-skew-rejected-key')
+    const outsideSkew = new Date(now.getTime() + 5 * 60_000 + 1)
+    const rejected = await outcome(
+      secondSession.sessionId,
+      'verified',
+      'event-outside-skew',
+      outsideSkew,
+    )
+    expect(rejected).toMatchObject({
+      processingStatus: 'rejected',
+      reasonCode: 'KYC_PROVIDER_EVENT_FUTURE_TIMESTAMP',
+    })
+    expect((await profiles.findForPlayer(secondPlayer.id, pool))?.status).toBe('pending')
+    const rejectedEvent = await pool.query<{
+      processing_status: string
+      processing_reason_code: string
+      accepted_at: Date | null
+    }>(
+      `SELECT processing_status, processing_reason_code, accepted_at
+       FROM kyc_provider_events WHERE provider_event_id = 'event-outside-skew'`,
+    )
+    expect(rejectedEvent.rows[0]).toEqual({
+      processing_status: 'rejected',
+      processing_reason_code: 'KYC_PROVIDER_EVENT_FUTURE_TIMESTAMP',
+      accepted_at: null,
+    })
+  })
+
+  it('converges concurrent duplicate deliveries on one event and transition', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'concurrent-event-key')
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        outcome(session.sessionId, 'verified', 'event-concurrent-duplicate'),
+      ),
+    )
+    expect(results.filter((result) => result.processingStatus === 'processed')).toHaveLength(1)
+    expect(
+      results.filter((result) => result.processingStatus === 'ignored_duplicate'),
+    ).toHaveLength(5)
+    expect(new Set(results.map((result) => result.eventId)).size).toBe(1)
+    const effects = await pool.query<{ events: number; transitions: number }>(
+      `SELECT
+         (SELECT COUNT(*)::int FROM kyc_provider_events
+          WHERE provider_event_id = 'event-concurrent-duplicate') AS events,
+         (SELECT COUNT(*)::int FROM kyc_status_transitions
+          WHERE player_id = $1 AND to_status = 'verified') AS transitions`,
+      [player.id],
+    )
+    expect(effects.rows[0]).toEqual({ events: 1, transitions: 1 })
+  })
+
+  it('rejects player and provider ownership mismatches without changing state', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'ownership-key')
+    const fake = provider()
+    const wrongPlayer = await eventService().execute(
+      {
+        payload: fake.buildEvent({
+          providerEventId: 'event-wrong-player',
+          providerSessionReference: `fake-session-${session.sessionId}`,
+          claimedPlayerReference: randomUUID(),
+          resultingStatus: 'verified',
+          occurredAt: new Date(now.getTime() + 1_000),
+        }),
+      },
+      { actorType: 'PROVIDER', actorId: 'fake', correlationId: 'corr-wrong-player' },
+    )
+    expect(wrongPlayer).toMatchObject({
+      processingStatus: 'rejected',
+      reasonCode: 'KYC_PLAYER_MISMATCH',
+    })
+    await expect(
+      eventService().execute(
+        {
+          payload: {
+            ...fake.buildEvent({
+              providerEventId: 'event-wrong-provider',
+              providerSessionReference: `fake-session-${session.sessionId}`,
+              resultingStatus: 'verified',
+              occurredAt: new Date(now.getTime() + 2_000),
+            }),
+            provider: 'unexpected-provider',
+          },
+        },
+        {
+          actorType: 'PROVIDER',
+          actorId: 'unexpected-provider',
+          correlationId: 'corr-wrong-provider',
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'KYC_PROVIDER_MISMATCH', status: 400 })
+    expect((await getProfile().execute(player.id, actor('corr-owner-read'))).status).toBe(
+      'pending',
+    )
+  })
+
+  it('commits a durable security audit for an event identity collision', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'identity-conflict-key')
+    await outcome(session.sessionId, 'pending', 'event-identity-conflict')
+
+    await expect(
+      outcome(
+        session.sessionId,
+        'failed',
+        'event-identity-conflict',
+        new Date(now.getTime() + 1_000),
+      ),
+    ).rejects.toMatchObject({
+      code: 'KYC_PROVIDER_EVENT_IDENTITY_CONFLICT',
+      status: 409,
+    })
+
+    const securityAudit = await pool.query<{
+      outcome: string
+      reason_code: string
+      metadata: Record<string, unknown>
+    }>(
+      `SELECT outcome, reason_code, metadata
+       FROM audit_events
+       WHERE action = 'kyc.event_identity_conflict'
+         AND correlation_id = 'corr-event-event-identity-conflict'`,
+    )
+    expect(securityAudit.rows).toHaveLength(1)
+    expect(securityAudit.rows[0]).toMatchObject({
+      outcome: 'rejected',
+      reason_code: 'KYC_PROVIDER_EVENT_IDENTITY_CONFLICT',
+    })
+    expect(securityAudit.rows[0].metadata).not.toHaveProperty('payloadHash')
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('pending')
+    const storedEvent = await events.find('fake', 'event-identity-conflict', pool)
+    expect(storedEvent?.processingStatus).toBe('processed')
   })
 
   it('supports failed retry and prevents the old session from overwriting the new attempt', async () => {
@@ -368,7 +721,7 @@ describe('provider event processing', () => {
     const unknown = await outcome(randomUUID(), 'verified', 'event-unknown')
     expect(unknown).toMatchObject({
       processingStatus: 'rejected',
-      reasonCode: 'KYC_PROVIDER_REFERENCE_MISMATCH',
+      reasonCode: 'KYC_PROVIDER_SESSION_NOT_FOUND',
     })
     await outcome(
       session.sessionId,
@@ -422,7 +775,7 @@ describe('provider event processing', () => {
     expect(transitionCount.rows[0].count).toBe(1)
   })
 
-  it('stores only sanitized normalized metadata and a deterministic hash', async () => {
+  it('stores only allowlisted provider metadata and a deterministic hash', async () => {
     const player = await createPlayer()
     const session = await start(player, 'metadata-key')
     const fake = provider()
@@ -434,9 +787,11 @@ describe('provider event processing', () => {
           resultingStatus: 'verified',
           occurredAt: new Date(now.getTime() + 1_000),
           metadata: {
-            caseId: 'case-safe',
+            source: 'provider_test',
+            caseId: 'must-not-persist',
             bearerToken: 'must-not-persist',
-            nested: { password: 'must-not-persist' },
+            documentImage: 'must-not-persist',
+            nested: { password: 'must-not-persist', dateOfBirth: 'must-not-persist' },
           },
         }),
       },
@@ -449,11 +804,7 @@ describe('provider event processing', () => {
       `SELECT metadata, payload_hash FROM kyc_provider_events
        WHERE provider_event_id = 'event-sanitized'`,
     )
-    expect(stored.rows[0].metadata).toEqual({
-      caseId: 'case-safe',
-      bearerToken: '[REDACTED]',
-      nested: { password: '[REDACTED]' },
-    })
+    expect(stored.rows[0].metadata).toEqual({ source: 'provider_test' })
     expect(stored.rows[0].payload_hash).toMatch(/^[0-9a-f]{64}$/)
   })
 
@@ -478,7 +829,7 @@ describe('provider event processing', () => {
             }),
           },
           {
-            actorType: 'test_operator',
+            actorType: 'ADMIN',
             actorId: 'operator-1',
             correlationId: 'corr-forced-transition-failure',
           },
@@ -508,6 +859,38 @@ describe('provider event processing', () => {
 })
 
 describe('expiry, history, and eligibility integration', () => {
+  it('processes verified-profile expiry despite an expired-session backlog', async () => {
+    const pendingPlayer = await createPlayer()
+    const pendingSession = await start(pendingPlayer, 'backlog-pending')
+    const verifiedPlayer = await createPlayerWithSubject('auth0|backlog-verified')
+    const verifiedSession = await start(verifiedPlayer, 'backlog-verified')
+    await outcome(verifiedSession.sessionId, 'verified', 'event-backlog-verified')
+    now = new Date('2026-07-25T12:00:00Z')
+
+    const boundedExpiry = new ExpireKycSessionsService(
+      pool,
+      profiles,
+      sessions,
+      transitionService(),
+      audit,
+      1,
+      1,
+    )
+    const result = await boundedExpiry.execute(now, actor('corr-independent-expiry-batches'))
+
+    expect(result).toMatchObject({
+      expiredSessionIds: [pendingSession.sessionId],
+      sessionsExamined: 1,
+      sessionsExpired: 1,
+      profilesExamined: 1,
+      profilesExpired: 1,
+      failures: [],
+    })
+    expect(result.expiredProfileIds).toHaveLength(2)
+    expect((await profiles.findForPlayer(pendingPlayer.id, pool))?.status).toBe('expired')
+    expect((await profiles.findForPlayer(verifiedPlayer.id, pool))?.status).toBe('expired')
+  })
+
   it('expires sessions and verified profiles idempotently and supports retry', async () => {
     const player = await createPlayer()
     const first = await start(player, 'expiring-session')
@@ -521,7 +904,15 @@ describe('expiry, history, and eligibility integration', () => {
     )
     expect(
       await expiryService().execute(now, actor('corr-expire-session-repeat')),
-    ).toEqual({ expiredSessionIds: [], expiredProfileIds: [] })
+    ).toEqual({
+      expiredSessionIds: [],
+      expiredProfileIds: [],
+      sessionsExamined: 0,
+      sessionsExpired: 0,
+      profilesExamined: 0,
+      profilesExpired: 0,
+      failures: [],
+    })
 
     const second = await start(player, 'retry-expired')
     await outcome(
@@ -539,6 +930,175 @@ describe('expiry, history, and eligibility integration', () => {
     expect(
       (await getProfile().execute(player.id, actor('corr-verification-expired-read'))).status,
     ).toBe('expired')
+  })
+
+  it('lets concurrent expiry workers claim a due profile exactly once', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'expiry-race')
+    await outcome(session.sessionId, 'verified', 'event-expiry-race')
+    now = new Date('2026-07-25T12:00:00Z')
+    const results = await Promise.all([
+      expiryService().execute(now, {
+        actorType: 'SYSTEM',
+        actorId: 'worker-1',
+        correlationId: 'corr-expiry-worker-1',
+      }),
+      expiryService().execute(now, {
+        actorType: 'SYSTEM',
+        actorId: 'worker-2',
+        correlationId: 'corr-expiry-worker-2',
+      }),
+    ])
+    expect(results.flatMap((result) => result.expiredProfileIds)).toHaveLength(1)
+    const transitionsResult = await pool.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM kyc_status_transitions
+       WHERE player_id = $1 AND to_status = 'expired'`,
+      [player.id],
+    )
+    expect(transitionsResult.rows[0].count).toBe(1)
+  })
+
+  it('enforces transitions centrally and at the database boundary', async () => {
+    const player = await createPlayer()
+    await getProfile().execute(player.id, actor('corr-create-profile'))
+    await expect(
+      withTransaction(pool, (client) =>
+        transitionService().execute(
+          {
+            playerId: player.id,
+            toStatus: 'verified',
+            trigger: 'MANUAL_REVIEW_DECISION',
+            reasonCode: 'KYC_MANUAL_REVIEW_APPROVED',
+          },
+          actor('corr-invalid-transition'),
+          client,
+        ),
+      ),
+    ).rejects.toMatchObject({ code: 'KYC_INVALID_STATE_TRANSITION', status: 409 })
+    await expect(
+      pool.query(
+        `UPDATE player_kyc_profiles
+         SET status = 'failed', failure_reason_code = 'BYPASS_ATTEMPT',
+             version = version + 1
+         WHERE player_id = $1`,
+        [player.id],
+      ),
+    ).rejects.toBeDefined()
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('not_started')
+  })
+
+  it('records the complete manual-review approval workflow immutably', async () => {
+    const player = await createPlayer()
+    const session = await start(player, 'manual-approve-key')
+    await outcome(session.sessionId, 'manual_review', 'event-review-requested')
+    const reviewId = await activeReviewId(player.id)
+    await reviewService().open(
+      { reviewId, reasonCodes: ['DOCUMENT_CHECK_REQUIRED'], notes: 'Open case.' },
+      actor('corr-review-open'),
+    )
+    await reviewService().assign(
+      {
+        reviewId,
+        assigneeActorId: 'admin-reviewer-2',
+        reasonCodes: ['SPECIALIST_REVIEW'],
+      },
+      actor('corr-review-assign'),
+    )
+    now = new Date('2026-07-23T10:00:10Z')
+    const completed = await reviewService().approve(
+      {
+        reviewId,
+        reasonCodes: ['DOCUMENTS_ACCEPTED'],
+        notes: 'Threshold and document checks passed.',
+      },
+      actor('corr-review-approve'),
+    )
+    expect(completed).toMatchObject({ id: reviewId, status: 'completed' })
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('verified')
+    const actions = await pool.query<{
+      action: string
+      actor_type: string
+      previous_status: string
+      new_status: string
+    }>(
+      `SELECT action, actor_type, previous_status, new_status
+       FROM kyc_manual_review_actions
+       WHERE review_id = $1 ORDER BY created_at, id`,
+      [reviewId],
+    )
+    expect(actions.rows.map((row) => row.action).sort()).toEqual([
+      'review_approved',
+      'review_assigned',
+      'review_opened',
+      'review_requested',
+    ])
+    expect(actions.rows.every((row) => row.actor_type === 'ADMIN' || row.actor_type === 'PROVIDER')).toBe(true)
+    const decision = actions.rows.find((row) => row.action === 'review_approved')
+    expect(decision).toMatchObject({
+      previous_status: 'manual_review',
+      new_status: 'verified',
+    })
+    const transition = await pool.query<{
+      kyc_profile_id: string
+      actor_type: string
+      actor_id: string | null
+      reason_codes: string[]
+      transition_trigger: string
+      policy_version: string | null
+      profile_version: number
+    }>(
+      `SELECT kyc_profile_id, actor_type, actor_id, reason_codes,
+              transition_trigger, policy_version, profile_version
+       FROM kyc_status_transitions
+       WHERE player_id = $1 AND to_status = 'verified'`,
+      [player.id],
+    )
+    expect(transition.rows[0]).toMatchObject({
+      actor_type: 'ADMIN',
+      actor_id: 'operator-1',
+      transition_trigger: 'MANUAL_REVIEW_DECISION',
+      policy_version: 'eligibility-policy-v1',
+    })
+    expect(transition.rows[0].kyc_profile_id).toBeTruthy()
+    expect(transition.rows[0].profile_version).toBeGreaterThan(1)
+    expect(transition.rows[0].reason_codes).toContain('KYC_MANUAL_REVIEW_APPROVED')
+    expect(transition.rows[0].reason_codes).toContain('DOCUMENTS_ACCEPTED')
+    await expect(
+      pool.query(
+        `UPDATE kyc_manual_review_actions SET notes = 'changed' WHERE review_id = $1`,
+        [reviewId],
+      ),
+    ).rejects.toMatchObject({ code: '55000' })
+  })
+
+  it('records a manual-review rejection and denies eligibility', async () => {
+    let player = await createPlayer()
+    const session = await start(player, 'manual-reject-key')
+    await outcome(session.sessionId, 'manual_review', 'event-review-reject')
+    const reviewId = await activeReviewId(player.id)
+    now = new Date('2026-07-23T10:00:10Z')
+    await reviewService().reject(
+      { reviewId, reasonCodes: ['IDENTITY_MISMATCH'] },
+      actor('corr-review-reject'),
+    )
+    expect((await profiles.findForPlayer(player.id, pool))?.status).toBe('failed')
+    player = await new ChangeAccountStatusService(
+      pool,
+      players,
+      new PostgresAccountStatusTransitionRepository(),
+      audit,
+    ).execute(
+      { playerId: player.id, toStatus: 'active', reasonCode: 'TEST_ACTIVATE' },
+      actor('corr-review-reject-activate'),
+    )
+    const permissions = await new EligibilityPermissionService(eligibility()).forPlayer(
+      player,
+      { correlationId: 'corr-review-reject-permissions', actorId: identity.subject },
+    )
+    expect(permissions).toMatchObject({
+      kycStatus: 'failed',
+      permissions: { deposit: false, withdraw: false, placeWager: false },
+    })
   })
 
   it('feeds verified stored state into eligibility without bypassing account or restrictions', async () => {
@@ -590,6 +1150,32 @@ describe('expiry, history, and eligibility integration', () => {
     expect(restricted.kycStatus).toBe('verified')
     expect(restricted.permissions.deposit).toBe(false)
     expect(restricted.permissions.withdraw).toBe(true)
+  })
+
+  it('projects all /v1/me permissions through one database connection', async () => {
+    const player = await createPlayer()
+    let connectionCount = 0
+    const trackedPool = {
+      connect: async () => {
+        connectionCount += 1
+        return pool.connect()
+      },
+    } as Pool
+
+    const projected = await new EligibilityPermissionService(
+      eligibility(trackedPool),
+    ).forPlayer(player, {
+      correlationId: 'corr-permissions-single-connection',
+      actorId: identity.subject,
+    })
+
+    expect(projected.permissions).toBeDefined()
+    expect(connectionCount).toBe(1)
+    const decisions = await pool.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM eligibility_decisions
+       WHERE correlation_id = 'corr-permissions-single-connection'`,
+    )
+    expect(decisions.rows[0].count).toBe(6)
   })
 
   it('keeps transition history and provider event identity immutable', async () => {

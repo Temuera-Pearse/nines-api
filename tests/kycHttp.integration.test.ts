@@ -10,11 +10,14 @@ import { loadConfig } from '../src/config/config.js'
 import { PlayerRestrictionService } from '../src/eligibility/application/PlayerRestrictionService.js'
 import { PostgresRestrictionRepository } from '../src/eligibility/infrastructure/PostgresRestrictionRepository.js'
 import { ProcessKycProviderEventService } from '../src/kyc/application/ProcessKycProviderEventService.js'
+import { TransitionKycStatusService } from '../src/kyc/application/TransitionKycStatusService.js'
+import { PostgresKycManualReviewRepository } from '../src/kyc/infrastructure/PostgresKycManualReviewRepository.js'
 import { PostgresKycProfileRepository } from '../src/kyc/infrastructure/PostgresKycProfileRepository.js'
 import { PostgresKycProviderEventRepository } from '../src/kyc/infrastructure/PostgresKycProviderEventRepository.js'
 import { PostgresKycSessionRepository } from '../src/kyc/infrastructure/PostgresKycSessionRepository.js'
 import { PostgresKycStatusTransitionRepository } from '../src/kyc/infrastructure/PostgresKycStatusTransitionRepository.js'
 import { FakeKycProvider } from '../src/kyc/providers/FakeKycProvider.js'
+import type { KycProvider } from '../src/kyc/providers/KycProvider.js'
 import { ChangeAccountStatusService } from '../src/players/application/ChangeAccountStatusService.js'
 import { PostgresAccountStatusTransitionRepository } from '../src/players/infrastructure/PostgresAccountStatusTransitionRepository.js'
 import { PostgresPlayerRepository } from '../src/players/infrastructure/PostgresPlayerRepository.js'
@@ -56,23 +59,41 @@ const verifier: VerifyBearerToken = async (token) => {
 }
 const auth = { Authorization: 'Bearer human-token' }
 
-function app() {
+function app(kycProvider?: KycProvider) {
   return createApp({
     config,
     pool,
     logger,
     verifyBearerToken: verifier,
     clock: () => now,
+    kycProvider,
+    mockHostedKyc: kycProvider
+      ? {
+          async requirePendingSession() {
+            throw new Error('not used')
+          },
+          async submitOutcome() {
+            throw new Error('not used')
+          },
+        }
+      : undefined,
   })
 }
 
 function eventService() {
+  const profiles = new PostgresKycProfileRepository()
   return new ProcessKycProviderEventService(
     pool,
-    new PostgresKycProfileRepository(),
+    profiles,
     new PostgresKycSessionRepository(),
     new PostgresKycProviderEventRepository(),
-    new PostgresKycStatusTransitionRepository(),
+    new TransitionKycStatusService(
+      profiles,
+      new PostgresKycStatusTransitionRepository(),
+      new PostgresKycManualReviewRepository(),
+      new PostgresAuditRepository(),
+      () => now,
+    ),
     new PostgresAuditRepository(),
     new FakeKycProvider(60 * 60_000, () => now),
     24 * 60 * 60_000,
@@ -97,7 +118,7 @@ async function processOutcome(
       }),
     },
     {
-      actorType: 'fake_provider',
+      actorType: 'PROVIDER',
       actorId: 'fake',
       correlationId: `corr-${eventId}`,
     },
@@ -191,6 +212,55 @@ describe('player-facing KYC API', () => {
     })
     expect(profile.body).not.toHaveProperty('providerSessionReference')
     expect(profile.body).not.toHaveProperty('payloadHash')
+  })
+
+  it('replays provider creation failures for the same key and allows a new-key attempt', async () => {
+    const delegate = new FakeKycProvider(
+      60 * 60_000,
+      () => now,
+      'http://localhost:3002',
+    )
+    let failedSessionId: string | null = null
+    let providerCalls = 0
+    const failFirstLogicalSession: KycProvider = {
+      providerName: delegate.providerName,
+      async createVerificationSession(input) {
+        providerCalls += 1
+        if (failedSessionId === null) {
+          failedSessionId = input.internalSessionId
+          throw new Error('private provider failure details')
+        }
+        return delegate.createVerificationSession(input)
+      },
+      verifyAndNormalizeEvent: (input) => delegate.verifyAndNormalizeEvent(input),
+    }
+    const testApp = app(failFirstLogicalSession)
+    const requestStart = (key: string) =>
+      request(testApp)
+        .post('/v1/me/kyc/sessions')
+        .set(auth)
+        .set('Idempotency-Key', key)
+        .set('X-Correlation-Id', `corr-${key}`)
+
+    const first = await requestStart('http-provider-failure')
+    const replay = await requestStart('http-provider-failure')
+    expect(first.status).toBe(503)
+    expect(replay.status).toBe(503)
+    expect(replay.body).toEqual(first.body)
+    expect(first.body.error.code).toBe('KYC_SESSION_CREATION_FAILED')
+    expect(JSON.stringify(first.body)).not.toContain('private provider failure')
+    expect(providerCalls).toBe(1)
+
+    const retry = await requestStart('http-provider-retry-new-key')
+    expect(retry.status).toBe(200)
+    expect(retry.body.status).toBe('pending')
+    expect(retry.body.sessionId).not.toBe(failedSessionId)
+    expect(providerCalls).toBe(2)
+
+    const replayAfterRetry = await requestStart('http-provider-failure')
+    expect(replayAfterRetry.status).toBe(503)
+    expect(replayAfterRetry.body.error.code).toBe('KYC_SESSION_CREATION_FAILED')
+    expect(providerCalls).toBe(2)
   })
 
   it('serves only a current, unexpired pending session on the hosted page', async () => {
@@ -356,6 +426,40 @@ describe('player-facing KYC API', () => {
     expect(restricted.body.kycStatus).toBe('verified')
     expect(restricted.body.permissions.deposit).toBe(false)
     expect(restricted.body.permissions.withdraw).toBe(true)
+  })
+
+  it('expires elapsed approval at request time before projecting /v1/me permissions', async () => {
+    const session = await startKyc('http-request-expiry-key')
+    await processOutcome(session.body.sessionId, 'verified', 'http-request-expiry-event')
+    const before = await me()
+    await new ChangeAccountStatusService(
+      pool,
+      new PostgresPlayerRepository(),
+      new PostgresAccountStatusTransitionRepository(),
+      new PostgresAuditRepository(),
+    ).execute(
+      { playerId: before.body.playerId, toStatus: 'active', reasonCode: 'HTTP_TEST_ACTIVATE' },
+      {
+        actorType: 'test_operator',
+        actorId: 'operator-1',
+        correlationId: 'corr-request-expiry-activate',
+      },
+    )
+    expect((await me()).body.permissions.deposit).toBe(true)
+
+    now = new Date('2026-07-25T10:00:00Z')
+    const expired = await me()
+    expect(expired.body).toMatchObject({
+      kycStatus: 'expired',
+      permissions: { deposit: false, withdraw: false, placeWager: false },
+    })
+    const transitions = await pool.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM kyc_status_transitions
+       WHERE player_id = $1 AND to_status = 'expired'
+         AND transition_trigger = 'REQUEST_TIME_EXPIRY'`,
+      [before.body.playerId],
+    )
+    expect(transitions.rows[0].count).toBe(1)
   })
 
   it('reports failed, manual-review, and expired outcomes safely', async () => {

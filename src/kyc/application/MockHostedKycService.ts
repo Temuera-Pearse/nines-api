@@ -127,7 +127,7 @@ export class MockHostedKycService {
         }),
       },
       {
-        actorType: 'fake_provider',
+        actorType: 'PROVIDER',
         actorId: 'mock_hosted_page',
         correlationId,
       },

@@ -14,6 +14,7 @@ describe('FakeKycProvider', () => {
       provider.createVerificationSession({
         playerId: 'player-1',
         internalSessionId: 'session-1',
+        idempotencyKey: 'session-1',
         correlationId: 'corr-1',
       }),
     ).resolves.toEqual({
@@ -30,9 +31,39 @@ describe('FakeKycProvider', () => {
       disabled.createVerificationSession({
         playerId: 'player-1',
         internalSessionId: 'session-1',
+        idempotencyKey: 'session-1',
         correlationId: 'corr-1',
       }),
     ).resolves.toMatchObject({ verificationUrl: null })
+  })
+
+  it('replays one logical session for concurrent calls using the internal session id', async () => {
+    const replaySafe = new FakeKycProvider(60 * 60_000, () => now)
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        replaySafe.createVerificationSession({
+          playerId: 'player-1',
+          internalSessionId: 'session-concurrent',
+          idempotencyKey: 'session-concurrent',
+          correlationId: 'corr-concurrent',
+        }),
+      ),
+    )
+    expect(new Set(results.map((result) => result.providerSessionReference))).toEqual(
+      new Set(['fake-session-session-concurrent']),
+    )
+    expect(results.every((result) => result === results[0])).toBe(true)
+  })
+
+  it('rejects a provider idempotency key that is not the internal session id', async () => {
+    await expect(
+      provider.createVerificationSession({
+        playerId: 'player-1',
+        internalSessionId: 'session-contract',
+        idempotencyKey: 'request-id-is-not-allowed',
+        correlationId: 'corr-contract',
+      }),
+    ).rejects.toThrow('requires the internal session ID')
   })
 
   it.each(['pending', 'verified', 'failed', 'manual_review', 'expired'] as const)(
@@ -53,8 +84,27 @@ describe('FakeKycProvider', () => {
         occurredAt: now,
       })
       expect(normalized.payloadHash).toBe(deterministicPayloadHash(payload))
+      expect(normalized.metadata).toEqual({})
     },
   )
+
+  it('allowlists provider metadata and drops unknown or sensitive fields', async () => {
+    const payload = provider.buildEvent({
+      providerEventId: 'event-metadata',
+      providerSessionReference: 'fake-session-session-1',
+      resultingStatus: 'verified',
+      occurredAt: now,
+      metadata: {
+        source: 'mock_hosted_page',
+        name: 'must-not-persist',
+        documentImage: 'must-not-persist',
+        arbitraryVendorData: { value: 'must-not-persist' },
+      },
+    })
+    await expect(provider.verifyAndNormalizeEvent({ payload })).resolves.toMatchObject({
+      metadata: { source: 'mock_hosted_page' },
+    })
+  })
 
   it('hashes equivalent objects independently of key ordering', () => {
     expect(deterministicPayloadHash({ b: 2, a: 1 })).toBe(
@@ -77,6 +127,8 @@ describe('FakeKycProvider', () => {
           occurredAt: now.toISOString(),
         },
       }),
-    ).rejects.toThrow('structure is invalid')
+    ).rejects.toMatchObject({
+      reasonCode: 'KYC_PROVIDER_MISMATCH',
+    })
   })
 })

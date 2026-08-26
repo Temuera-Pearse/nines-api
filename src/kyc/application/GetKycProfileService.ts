@@ -8,6 +8,7 @@ import type { KycProfileRepository } from '../infrastructure/KycProfileRepositor
 import type { KycSessionRepository } from '../infrastructure/KycSessionRepository.js'
 import type { KycActorContext } from './KycContext.js'
 import { getOrCreateKycProfile } from './profileCreation.js'
+import type { TransitionKycStatusService } from './TransitionKycStatusService.js'
 
 export interface SafeKycSession {
   sessionId: string
@@ -31,6 +32,7 @@ export class GetKycProfileService {
     private readonly profiles: KycProfileRepository,
     private readonly sessions: KycSessionRepository,
     private readonly audit: AuditRepository,
+    private readonly transitions: TransitionKycStatusService,
   ) {}
 
   async execute(playerId: string, actor: KycActorContext): Promise<SafeKycProfile> {
@@ -42,13 +44,14 @@ export class GetKycProfileService {
           message: 'Player was not found',
         })
       }
-      const { profile } = await getOrCreateKycProfile(
+      let { profile } = await getOrCreateKycProfile(
         playerId,
         actor,
         this.profiles,
         this.audit,
         client,
       )
+      profile = (await this.transitions.expireIfDue(playerId, actor, client)) ?? profile
       const session =
         profile.currentSessionId &&
         (profile.status === 'pending' || profile.status === 'manual_review')

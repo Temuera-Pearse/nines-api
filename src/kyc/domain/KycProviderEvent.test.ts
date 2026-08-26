@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { NormalizedKycProviderEvent } from './KycProviderEvent.js'
-import { isStaleKycEvent } from './KycProviderEvent.js'
+import {
+  assertKycProviderEventMetadata,
+  isStaleKycEvent,
+  normalizeKycProviderEventMetadata,
+} from './KycProviderEvent.js'
 
 const event: NormalizedKycProviderEvent = {
   provider: 'fake',
   providerEventId: 'event-1',
   providerSessionReference: 'session-1',
+  claimedPlayerReference: null,
   eventType: 'verification.verified',
   resultingStatus: 'verified',
   occurredAt: new Date('2026-01-02T00:00:00Z'),
@@ -67,5 +72,28 @@ describe('KYC event precedence', () => {
         sessionStatus: 'manual_review',
       }),
     ).toBe(true)
+  })
+})
+
+describe('KYC provider event metadata boundary', () => {
+  it('keeps only the runtime-validated provider-neutral allowlist', () => {
+    expect(
+      normalizeKycProviderEventMetadata({
+        source: 'mock_hosted_page',
+        name: 'must-not-persist',
+        documentImage: 'must-not-persist',
+      }),
+    ).toEqual({ source: 'mock_hosted_page' })
+    expect(normalizeKycProviderEventMetadata({ source: 'contains spaces' })).toEqual({})
+  })
+
+  it('rejects non-allowlisted metadata at the repository-facing boundary', () => {
+    expect(() =>
+      assertKycProviderEventMetadata(
+        { source: 'provider', secretVendorField: 'unsafe' } as unknown as {
+          source?: string
+        },
+      ),
+    ).toThrow('non-allowlisted')
   })
 })
