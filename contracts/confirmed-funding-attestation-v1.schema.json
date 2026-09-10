@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.nines.internal/confirmed-funding-attestation-v1.schema.json",
+  "title": "ConfirmedFundingAttestationV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "eventType", "fundingAttestationId", "issuer", "audience",
+    "environment", "playerId", "fundingIntentId", "provider", "externalPayment",
+    "confirmedAt", "issuedAt", "automaticProcessingUntil", "purchaseEligibility",
+    "correlationId", "causationId"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "eventType": { "const": "external_funding_confirmed" },
+    "fundingAttestationId": { "type": "string", "format": "uuid" },
+    "issuer": { "const": "nines-api" },
+    "audience": { "const": "nines-financial" },
+    "environment": { "enum": ["development", "test", "production"] },
+    "playerId": { "type": "string", "format": "uuid" },
+    "fundingIntentId": { "type": "string", "format": "uuid" },
+    "provider": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "paymentReference", "confirmationEventId"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "paymentReference": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "confirmationEventId": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "externalPayment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset", "atomicUnits", "scale"],
+      "properties": {
+        "asset": { "type": "string", "pattern": "^[A-Z][A-Z0-9]{1,11}$" },
+        "atomicUnits": { "type": "string", "pattern": "^[1-9][0-9]*$", "maxLength": 96 },
+        "scale": { "type": "integer", "minimum": 0, "maximum": 30 }
+      }
+    },
+    "confirmedAt": { "type": "string", "format": "date-time" },
+    "issuedAt": { "type": "string", "format": "date-time" },
+    "automaticProcessingUntil": { "type": "string", "format": "date-time" },
+    "purchaseEligibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decisionId", "policyVersion", "evaluatedAt"],
+      "properties": {
+        "decisionId": { "type": "string", "format": "uuid" },
+        "policyVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "evaluatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "correlationId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "causationId": { "type": "string", "minLength": 1, "maxLength": 256 }
+  }
+}

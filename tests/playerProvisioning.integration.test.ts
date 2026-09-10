@@ -96,6 +96,7 @@ describe('database migrations', () => {
       '003_phase_3_kyc.sql',
       '004_phase_3_5_kyc_lifecycle_hardening.sql',
       '005_phase_4_crypto_funding.sql',
+      '006_confirmed_funding_attestations.sql',
     ])
   })
 

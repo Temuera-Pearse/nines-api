@@ -13,6 +13,10 @@ import {
   type StoredCryptoProviderEvent,
 } from '../domain/CryptoProviderEvent.js'
 import type { CryptoReconciliationType } from '../domain/CryptoReconciliation.js'
+import {
+  hashConfirmedFundingAttestation,
+  type ConfirmedFundingAttestationV1,
+} from '../domain/ConfirmedFundingAttestation.js'
 import type { CryptoFundingRepository } from '../infrastructure/CryptoFundingRepository.js'
 import { CryptoProviderInputError, type CryptoFundingProvider, type RawCryptoProviderEvent } from '../providers/CryptoFundingProvider.js'
 import type { CryptoAssetPolicy } from './CreateCryptoFundingIntentService.js'
@@ -45,6 +49,8 @@ export class ProcessCryptoProviderEventService {
     private readonly assetPolicies: readonly CryptoAssetPolicy[],
     private readonly maxFutureSkewMs: number,
     private readonly clock: () => Date = () => new Date(),
+    private readonly environment: 'development' | 'test' | 'production' = 'test',
+    private readonly automaticProcessingWindowMs = 24 * 60 * 60_000,
   ) {}
 
   async execute(input: RawCryptoProviderEvent, actor: CryptoFundingActorContext): Promise<ProcessCryptoProviderEventResult> {
@@ -164,13 +170,54 @@ export class ProcessCryptoProviderEventService {
         failedAt: targetStatus === 'failed' ? receivedAt : undefined,
         providerEventAt: normalized.providerOccurredAt }, actor, client, intent)
       if (targetStatus === 'confirmed') {
-        await this.repository.createFinancialInstruction({ id: randomUUID(), intent: updated,
-          confirmedAt: receivedAt, createdAt: receivedAt }, client)
+        const policy = this.assetPolicies.find((candidate) => candidate.asset === updated.asset)
+        if (!policy || !updated.providerReference || !updated.eligibilityDecisionId ||
+            !updated.eligibilityPolicyVersion || !updated.eligibilityEvaluatedAt) {
+          throw new Error('Confirmed funding is missing attestation evidence')
+        }
+        const fundingAttestationId = randomUUID()
+        const attestation: ConfirmedFundingAttestationV1 = {
+          schemaVersion: 1,
+          eventType: 'external_funding_confirmed',
+          fundingAttestationId,
+          issuer: 'nines-api',
+          audience: 'nines-financial',
+          environment: this.environment,
+          playerId: updated.playerId,
+          fundingIntentId: updated.id,
+          provider: {
+            name: updated.provider,
+            paymentReference: updated.providerReference,
+            confirmationEventId: normalized.providerEventId,
+          },
+          externalPayment: {
+            asset: updated.asset,
+            atomicUnits: parseCryptoAmount(updated.requestedAmount, policy.decimals).units.toString(),
+            scale: policy.decimals,
+          },
+          confirmedAt: receivedAt.toISOString(),
+          issuedAt: receivedAt.toISOString(),
+          automaticProcessingUntil: new Date(
+            receivedAt.getTime() + this.automaticProcessingWindowMs,
+          ).toISOString(),
+          purchaseEligibility: {
+            decisionId: updated.eligibilityDecisionId,
+            policyVersion: updated.eligibilityPolicyVersion,
+            evaluatedAt: updated.eligibilityEvaluatedAt.toISOString(),
+          },
+          correlationId: actor.correlationId,
+          causationId: inserted.event.id,
+        }
+        await this.repository.createFundingAttestation({ attestation,
+          payloadHash: hashConfirmedFundingAttestation(attestation), intent: updated,
+          confirmationEventRecordId: inserted.event.id, createdAt: receivedAt }, client)
         await this.audit.append({
           id: randomUUID(), actorType: 'SYSTEM', actorId: 'crypto_funding_outbox', playerId: intent.playerId,
-          action: 'crypto.financial_funding_instruction_created', outcome: 'success',
+          action: 'crypto.confirmed_funding_attestation_created', outcome: 'success',
           reasonCode: 'CRYPTO_PAYMENT_CONFIRMED', correlationId: actor.correlationId,
-          metadata: { fundingIntentId: intent.id, source: 'CRYPTO', asset: intent.asset, externalAmount: intent.requestedAmount },
+          metadata: { fundingAttestationId, fundingIntentId: intent.id, source: 'CRYPTO',
+            asset: intent.asset, externalAmount: intent.requestedAmount,
+            attestationPayloadHash: hashConfirmedFundingAttestation(attestation) },
         }, client)
       }
       const marked = await this.repository.markEvent({ eventId: inserted.event.id, fundingIntentId: intent.id,

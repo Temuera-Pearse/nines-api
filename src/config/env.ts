@@ -24,6 +24,13 @@ export interface ParsedEnvironment {
   cryptoFundingIntentTtlMinutes: number
   cryptoProviderMaxFutureSkewSeconds: number
   cryptoFakeWebhookSecret: string | null
+  fundingAttestationDeliveryEnabled: boolean
+  financialServiceBaseUrl: string | null
+  securityEvidenceDeliveryEnabled: boolean
+  securityServiceBaseUrl: string | null
+  serviceAuthHmacSecret: string | null
+  serviceAuthKeyId: string
+  serviceDeliveryPollIntervalMs: number
 }
 
 export interface ParseEnvironmentOptions {
@@ -171,6 +178,21 @@ function parsePublicApiBaseUrl(
   return url.origin
 }
 
+function parseServiceBaseUrl(value: string | undefined, name: string,
+  nodeEnvironment: ParsedEnvironment['nodeEnvironment']): string | null {
+  const normalized = value?.trim() ?? ''
+  if (!normalized) return null
+  let url: URL
+  try { url = new URL(normalized) } catch { throw new Error(`${name} must be a valid HTTP URL`) }
+  if (!['http:', 'https:'].includes(url.protocol) || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error(`${name} must be an HTTP origin without a path`)
+  }
+  if (nodeEnvironment === 'production' && url.protocol !== 'https:') {
+    throw new Error(`${name} must use HTTPS in production`)
+  }
+  return url.origin
+}
+
 export function parseEnvironment(
   source: NodeJS.ProcessEnv,
   options: ParseEnvironmentOptions = {},
@@ -210,6 +232,30 @@ export function parseEnvironment(
     } catch {
       throw new Error(`Crypto funding amount range exceeds configured precision for ${asset}`)
     }
+  }
+  const fundingAttestationDeliveryEnabled = parseBoolean(
+    source.FINANCIAL_FUNDING_ATTESTATION_DELIVERY_ENABLED,
+    'FINANCIAL_FUNDING_ATTESTATION_DELIVERY_ENABLED')
+  const securityEvidenceDeliveryEnabled = parseBoolean(
+    source.SECURITY_EVIDENCE_DELIVERY_ENABLED, 'SECURITY_EVIDENCE_DELIVERY_ENABLED')
+  const financialServiceBaseUrl = parseServiceBaseUrl(source.FINANCIAL_SERVICE_BASE_URL,
+    'FINANCIAL_SERVICE_BASE_URL', nodeEnvironment)
+  const securityServiceBaseUrl = parseServiceBaseUrl(source.SECURITY_SERVICE_BASE_URL,
+    'SECURITY_SERVICE_BASE_URL', nodeEnvironment)
+  if (fundingAttestationDeliveryEnabled && !financialServiceBaseUrl) {
+    throw new Error('FINANCIAL_SERVICE_BASE_URL is required when funding attestation delivery is enabled')
+  }
+  if (securityEvidenceDeliveryEnabled && !securityServiceBaseUrl) {
+    throw new Error('SECURITY_SERVICE_BASE_URL is required when security evidence delivery is enabled')
+  }
+  const serviceAuthHmacSecret = source.SERVICE_AUTH_HMAC_SECRET?.trim() || null
+  if ((fundingAttestationDeliveryEnabled || securityEvidenceDeliveryEnabled) &&
+      (!serviceAuthHmacSecret || serviceAuthHmacSecret.length < 32)) {
+    throw new Error('SERVICE_AUTH_HMAC_SECRET must contain at least 32 characters when service delivery is enabled')
+  }
+  if (nodeEnvironment === 'production' &&
+      (fundingAttestationDeliveryEnabled || securityEvidenceDeliveryEnabled)) {
+    throw new Error('Production service delivery requires a production authenticator; HMAC delivery is development/test only')
   }
 
   return {
@@ -252,5 +298,13 @@ export function parseEnvironment(
     cryptoFundingIntentTtlMinutes: parsePositiveInteger(source.CRYPTO_FUNDING_INTENT_TTL_MINUTES, 60, 'CRYPTO_FUNDING_INTENT_TTL_MINUTES'),
     cryptoProviderMaxFutureSkewSeconds: parsePositiveInteger(source.CRYPTO_PROVIDER_MAX_FUTURE_SKEW_SECONDS, 300, 'CRYPTO_PROVIDER_MAX_FUTURE_SKEW_SECONDS'),
     cryptoFakeWebhookSecret,
+    fundingAttestationDeliveryEnabled,
+    financialServiceBaseUrl,
+    securityEvidenceDeliveryEnabled,
+    securityServiceBaseUrl,
+    serviceAuthHmacSecret,
+    serviceAuthKeyId: source.SERVICE_AUTH_KEY_ID?.trim() || 'development-hmac-v1',
+    serviceDeliveryPollIntervalMs: parsePositiveInteger(source.SERVICE_DELIVERY_POLL_INTERVAL_MS,
+      1000, 'SERVICE_DELIVERY_POLL_INTERVAL_MS'),
   }
 }

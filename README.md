@@ -18,7 +18,7 @@ This working tree is the Phase 1–4 checkpoint:
 | 2 | Complete | Versioned eligibility policy, player restrictions, persisted decisions, permission projection, and deny-by-default authorization inputs. |
 | 3 | Complete | Provider-neutral KYC profiles, sessions, transitions, normalized provider events, idempotency, ordering, expiry logic, and eligibility integration. |
 | 3.5 | Complete | Central lifecycle transitions, provider-event ownership/idempotency/ordering, auditable manual review, approval expiry worker, and request-time protection. |
-| 4 | Complete | Provider-neutral external crypto funding intents, fake-provider sessions, authenticated callbacks, reconciliation, expiry, and a durable financial-instruction outbox. |
+| 4 | Complete | Provider-neutral external crypto funding intents, fake-provider sessions, authenticated callbacks, reconciliation, expiry, and durable confirmed-funding attestations. |
 
 The hosted mock proves the integration boundary without pretending to perform
 real identity verification. Phase 3.5 additionally hardens the complete KYC
@@ -128,8 +128,9 @@ No documents, photographs, biometrics, raw provider payloads, raw headers,
 access tokens, or full identity details are stored.
 
 Phase 4 adds funding intents and provider sessions, normalized callback events,
-append-only funding transitions, explicit reconciliation records, and the
-`financial_funding_instructions` outbox. Critical idempotency keys are unique
+append-only funding transitions, explicit reconciliation records, and an
+immutable confirmed-funding attestation outbox. The physical legacy table remains
+named `financial_funding_instructions`. Critical idempotency keys are unique
 in PostgreSQL, and a deferred trigger requires every status change to have a
 matching transition record.
 
@@ -144,7 +145,7 @@ mandatory idempotency key.
 Authenticated provider events enter at
 `POST /internal/provider-events/crypto/:provider`. The fake provider separates
 `detected`, `confirming`, and `confirmed`; only final confirmation atomically
-creates one durable financial instruction. Mismatched or late external value
+creates one durable confirmed-funding attestation. Mismatched or late external value
 is reconciled rather than credited. No player balance or ledger is implemented
 here. See the Phase 4 document for the full contract.
 
@@ -474,5 +475,17 @@ Phases 3 through 4 deliberately defer:
 - notification, email, and SMS integrations;
 - jurisdiction and geolocation providers;
 - responsible-gambling integrations;
-- real crypto providers, custody, wallets, keys, conversion, financial outbox
-  delivery, balances, ledgers, withdrawals, betting, and race integration.
+- real crypto providers, custody, wallets, keys, withdrawals, betting, and race integration.
+
+## Confirmed funding attestations
+
+Provider-confirmed USDC funding creates an immutable
+`external_funding_confirmed` v1 attestation and a Security evidence outbox row
+in the same transaction. A leased retry worker sends the attestation to
+`nines-financial`; API does not calculate NINES, create financial accounts, or
+write a ledger. Financial and Security delivery are separately configurable.
+Pre-attestation Phase 4 rows are retained as
+`legacy_reconciliation_required`; they are never fabricated into v1 evidence or
+sent through the v1 delivery worker.
+HMAC service authentication is development/test-only and production startup
+fails closed until a production authenticator is configured.

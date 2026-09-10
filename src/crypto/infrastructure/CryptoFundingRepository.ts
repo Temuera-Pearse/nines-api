@@ -16,6 +16,9 @@ export interface CreateCryptoFundingIntentInput {
   provider: string
   idempotencyKey: string
   requestHash: string
+  eligibilityDecisionId: string
+  eligibilityPolicyVersion: string
+  eligibilityEvaluatedAt: Date
   expiresAt: Date
   createdAt: Date
 }
@@ -81,10 +84,11 @@ export interface CryptoFundingRepository {
     correlationId: string
     createdAt: Date
   }, executor: QueryExecutor): Promise<void>
-  createFinancialInstruction(input: {
-    id: string
+  createFundingAttestation(input: {
+    attestation: import('../domain/ConfirmedFundingAttestation.js').ConfirmedFundingAttestationV1
+    payloadHash: string
     intent: CryptoFundingIntent
-    confirmedAt: Date
+    confirmationEventRecordId: string
     createdAt: Date
   }, executor: QueryExecutor): Promise<boolean>
 }

@@ -225,6 +225,7 @@ export function createApp(dependencies: CreateAppDependencies) {
       cryptoAssetPolicies,
       config.crypto.providerMaxFutureSkewSeconds * 1_000,
       clock,
+      config.environment,
     )
     app.use('/internal', createCryptoProviderEventRouter(cryptoProvider.providerName, processCryptoProviderEvent))
   }

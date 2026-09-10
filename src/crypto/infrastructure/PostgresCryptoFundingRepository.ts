@@ -1,5 +1,6 @@
 import type { QueryResultRow } from 'pg'
 import type { QueryExecutor } from '../../shared/db/transaction.js'
+import { hashCanonicalJson } from '../../shared/contracts/canonicalJson.js'
 import type { CryptoFundingIntent, CryptoFundingStatus } from '../domain/CryptoFunding.js'
 import type {
   CryptoEventProcessingStatus,
@@ -24,6 +25,9 @@ interface IntentRow extends QueryResultRow {
   provider: string
   idempotency_key: string
   request_hash: string
+  eligibility_decision_id: string | null
+  eligibility_policy_version: string | null
+  eligibility_evaluated_at: Date | null
   provider_reference: string | null
   payment_url: string | null
   expires_at: Date
@@ -59,7 +63,8 @@ interface EventRow extends QueryResultRow {
 }
 
 const INTENT_COLUMNS = `id, player_id, asset, requested_amount, status, provider,
-  idempotency_key, request_hash, provider_reference, payment_url, expires_at,
+  idempotency_key, request_hash, eligibility_decision_id, eligibility_policy_version,
+  eligibility_evaluated_at, provider_reference, payment_url, expires_at,
   confirmed_at, failed_at, last_provider_event_at, version, created_at, updated_at`
 
 const EVENT_COLUMNS = `id, funding_intent_id, provider, provider_event_id,
@@ -78,6 +83,9 @@ function mapIntent(row: IntentRow): CryptoFundingIntent {
     provider: row.provider,
     idempotencyKey: row.idempotency_key,
     requestHash: row.request_hash,
+    eligibilityDecisionId: row.eligibility_decision_id,
+    eligibilityPolicyVersion: row.eligibility_policy_version,
+    eligibilityEvaluatedAt: row.eligibility_evaluated_at,
     providerReference: row.provider_reference,
     paymentUrl: row.payment_url,
     expiresAt: row.expires_at,
@@ -128,20 +136,22 @@ export class PostgresCryptoFundingRepository implements CryptoFundingRepository 
       `WITH created AS (
          INSERT INTO crypto_funding_intents
            (id, player_id, asset, requested_amount, status, provider,
-            idempotency_key, request_hash, expires_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'provider_pending', $5, $6, $7, $8, $9, $9)
+            idempotency_key, request_hash, eligibility_decision_id,
+            eligibility_policy_version, eligibility_evaluated_at, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'provider_pending', $5, $6, $7, $8, $9, $10, $11, $12, $12)
          ON CONFLICT (player_id, idempotency_key) DO NOTHING
          RETURNING id
        ), session AS (
          INSERT INTO crypto_funding_provider_sessions
            (id, funding_intent_id, provider, provider_idempotency_key, status, created_at, updated_at)
-         SELECT $10, id, $5, id, 'creating', $9, $9 FROM created
+         SELECT $13, id, $5, id, 'creating', $12, $12 FROM created
        )
        SELECT ${INTENT_COLUMNS} FROM crypto_funding_intents
        WHERE id IN (SELECT id FROM created)`,
       [input.id, input.playerId, input.asset, input.requestedAmount, input.provider,
-        input.idempotencyKey, input.requestHash, input.expiresAt, input.createdAt,
-        input.providerSessionId],
+        input.idempotencyKey, input.requestHash, input.eligibilityDecisionId,
+        input.eligibilityPolicyVersion, input.eligibilityEvaluatedAt, input.expiresAt,
+        input.createdAt, input.providerSessionId],
     )
     return result.rows[0] ? mapIntent(result.rows[0]) : null
   }
@@ -301,18 +311,54 @@ export class PostgresCryptoFundingRepository implements CryptoFundingRepository 
     )
   }
 
-  async createFinancialInstruction(input: Parameters<CryptoFundingRepository['createFinancialInstruction']>[0], executor: QueryExecutor): Promise<boolean> {
+  async createFundingAttestation(input: Parameters<CryptoFundingRepository['createFundingAttestation']>[0], executor: QueryExecutor): Promise<boolean> {
     if (!input.intent.providerReference) throw new Error('Confirmed funding requires a provider reference')
+    const { attestation } = input
     const result = await executor.query(
       `INSERT INTO financial_funding_instructions
         (id, funding_intent_id, player_id, asset, external_amount, provider,
-         provider_reference, confirmed_at, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         provider_reference, confirmed_at, created_at, schema_version, event_type,
+         confirmation_event_id, provider_confirmation_event_id, external_atomic_units,
+         external_scale, eligibility_decision_id, eligibility_policy_version,
+         eligibility_evaluated_at, issued_at, automatic_processing_until,
+         correlation_id, causation_id, payload_hash, attestation_payload,
+         next_attempt_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+         $19,$20,$21,$22,$23,$24::jsonb,$19)
        ON CONFLICT (funding_intent_id) DO NOTHING RETURNING id`,
-      [input.id, input.intent.id, input.intent.playerId, input.intent.asset,
+      [attestation.fundingAttestationId, input.intent.id, input.intent.playerId, input.intent.asset,
         input.intent.requestedAmount, input.intent.provider, input.intent.providerReference,
-        input.confirmedAt, input.createdAt],
+        new Date(attestation.confirmedAt), input.createdAt, attestation.schemaVersion,
+        attestation.eventType, input.confirmationEventRecordId,
+        attestation.provider.confirmationEventId, attestation.externalPayment.atomicUnits,
+        attestation.externalPayment.scale, attestation.purchaseEligibility.decisionId,
+        attestation.purchaseEligibility.policyVersion,
+        new Date(attestation.purchaseEligibility.evaluatedAt), new Date(attestation.issuedAt),
+        new Date(attestation.automaticProcessingUntil), attestation.correlationId,
+        attestation.causationId, input.payloadHash, JSON.stringify(attestation)],
     )
-    return Boolean(result.rows[0])
+    if (!result.rows[0]) return false
+    const evidencePayload = {
+      schemaVersion: 1,
+      eventId: attestation.fundingAttestationId,
+      eventType: 'api.external_funding_confirmed.v1',
+      sourceService: 'nines-api',
+      environment: attestation.environment,
+      fundingAttestationId: attestation.fundingAttestationId,
+      occurredAt: attestation.issuedAt,
+      correlationId: attestation.correlationId,
+      causationId: attestation.causationId,
+      attestation,
+    }
+    await executor.query(
+      `INSERT INTO security_evidence_outbox
+        (id, source_event_id, event_type, funding_attestation_id, payload,
+         payload_hash, created_at, next_attempt_at)
+       VALUES ($1,$1,$2,$3,$4::jsonb,$5,$6,$6)`,
+      [attestation.fundingAttestationId, evidencePayload.eventType,
+        attestation.fundingAttestationId, JSON.stringify(evidencePayload),
+        hashCanonicalJson(evidencePayload as never), input.createdAt],
+    )
+    return true
   }
 }

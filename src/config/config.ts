@@ -31,6 +31,15 @@ export interface AppConfig {
     providerMaxFutureSkewSeconds: number
     fakeWebhookSecret: string | null
   }>
+  readonly serviceDelivery: Readonly<{
+    fundingAttestationsEnabled: boolean
+    financialBaseUrl: string | null
+    securityEvidenceEnabled: boolean
+    securityBaseUrl: string | null
+    hmacSecret: string | null
+    keyId: string
+    pollIntervalMs: number
+  }>
 }
 
 export function loadConfig(
@@ -61,6 +70,15 @@ export function loadConfig(
       intentTtlMinutes: env.cryptoFundingIntentTtlMinutes,
       providerMaxFutureSkewSeconds: env.cryptoProviderMaxFutureSkewSeconds,
       fakeWebhookSecret: env.cryptoFakeWebhookSecret,
+    }),
+    serviceDelivery: Object.freeze({
+      fundingAttestationsEnabled: env.fundingAttestationDeliveryEnabled,
+      financialBaseUrl: env.financialServiceBaseUrl,
+      securityEvidenceEnabled: env.securityEvidenceDeliveryEnabled,
+      securityBaseUrl: env.securityServiceBaseUrl,
+      hmacSecret: env.serviceAuthHmacSecret,
+      keyId: env.serviceAuthKeyId,
+      pollIntervalMs: env.serviceDeliveryPollIntervalMs,
     }),
   })
 }

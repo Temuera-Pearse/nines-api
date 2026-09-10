@@ -26,6 +26,8 @@ export async function resetAndMigrateTestDatabase(pool: Pool): Promise<void> {
 }
 
 export async function resetTestDatabase(pool: Pool): Promise<void> {
+  await pool.query('DROP TABLE IF EXISTS security_evidence_outbox CASCADE')
+  await pool.query('DROP TABLE IF EXISTS financial_funding_delivery_attempts CASCADE')
   await pool.query('DROP TABLE IF EXISTS crypto_funding_reconciliations CASCADE')
   await pool.query('DROP TABLE IF EXISTS financial_funding_instructions CASCADE')
   await pool.query('DROP TABLE IF EXISTS crypto_funding_transitions CASCADE')
@@ -50,6 +52,8 @@ export async function resetTestDatabase(pool: Pool): Promise<void> {
 export async function truncatePhase1Tables(pool: Pool): Promise<void> {
   await pool.query(
     `TRUNCATE TABLE
+       security_evidence_outbox,
+       financial_funding_delivery_attempts,
        crypto_funding_reconciliations,
        financial_funding_instructions,
        crypto_funding_transitions,

@@ -217,7 +217,7 @@ describe('crypto provider events, confirmation, and reconciliation', () => {
     expect(effects.rows[0]).toEqual({ sessions: 1, instructions: 1 })
   })
 
-  it('keeps detection and confirmation distinct and creates one funding instruction', async () => {
+  it('keeps detection and confirmation distinct and creates one funding attestation', async () => {
     const intent = await createIntent(await createPlayer(), 'progression')
     await expect(providerEvent(intent, 'payment_detected', 'event-detected')).resolves.toMatchObject({ fundingStatus: 'detected' })
     now = new Date(now.getTime() + 1_000)
@@ -230,10 +230,24 @@ describe('crypto provider events, confirmation, and reconciliation', () => {
     now = new Date(now.getTime() + 1_000)
     const laterConfirmation = await providerEvent(intent, 'confirmed', 'event-confirmed-later')
     expect(laterConfirmation.processingStatus).toBe('ignored_stale')
-    const counts = await pool.query<{ instructions: number; transitions: number }>(
+    const counts = await pool.query<{ instructions: number; transitions: number; evidence: number }>(
       `SELECT (SELECT COUNT(*)::int FROM financial_funding_instructions WHERE funding_intent_id = $1) AS instructions,
-              (SELECT COUNT(*)::int FROM crypto_funding_transitions WHERE funding_intent_id = $1) AS transitions`, [intent.id])
-    expect(counts.rows[0]).toEqual({ instructions: 1, transitions: 4 })
+              (SELECT COUNT(*)::int FROM crypto_funding_transitions WHERE funding_intent_id = $1) AS transitions,
+              (SELECT COUNT(*)::int FROM security_evidence_outbox WHERE funding_attestation_id =
+                (SELECT id FROM financial_funding_instructions WHERE funding_intent_id = $1)) AS evidence`, [intent.id])
+    expect(counts.rows[0]).toEqual({ instructions: 1, transitions: 4, evidence: 1 })
+    const attestation = await pool.query<{ schema_version: number; event_type: string;
+      external_atomic_units: string; external_scale: number; eligibility_decision_id: string;
+      payload_hash: string; automatic_processing_until: Date; issued_at: Date }>(
+      `SELECT schema_version,event_type,external_atomic_units,external_scale,
+        eligibility_decision_id,payload_hash,automatic_processing_until,issued_at
+       FROM financial_funding_instructions WHERE funding_intent_id=$1`, [intent.id])
+    expect(attestation.rows[0]).toMatchObject({ schema_version: 1,
+      event_type: 'external_funding_confirmed', external_atomic_units: '100000000',
+      external_scale: 6 })
+    expect(attestation.rows[0].payload_hash).toMatch(/^[0-9a-f]{64}$/)
+    expect(attestation.rows[0].automatic_processing_until.getTime() -
+      attestation.rows[0].issued_at.getTime()).toBe(24 * 60 * 60_000)
   })
 
   it('converges concurrent duplicate callbacks and ignores stale ordering', async () => {
@@ -275,7 +289,7 @@ describe('crypto provider events, confirmation, and reconciliation', () => {
     ['UNDERPAID', 'USDC', '99'],
     ['OVERPAID', 'USDC', '101'],
     ['AMOUNT_UNDETERMINED', 'USDC', null],
-  ] as const)('records %s instead of creating a credit instruction', async (type, asset, amount) => {
+  ] as const)('records %s instead of creating a funding attestation', async (type, asset, amount) => {
     const intent = await createIntent(await createPlayer(), `mismatch-${type}`)
     const result = await providerEvent(intent, 'confirmed', `event-${type}`, { asset, amount })
     expect(result.processingStatus).toBe('rejected')
@@ -287,7 +301,7 @@ describe('crypto provider events, confirmation, and reconciliation', () => {
     expect(instructions.rows[0].count).toBe(0)
   })
 
-  it('rolls confirmation back atomically when instruction persistence fails', async () => {
+  it('rolls confirmation back atomically when attestation persistence fails', async () => {
     const intent = await createIntent(await createPlayer(), 'rollback-confirmation')
     await pool.query(`ALTER TABLE financial_funding_instructions
       ADD CONSTRAINT crypto_test_force_instruction_failure CHECK (funding_intent_id IS NULL)`)
@@ -300,7 +314,7 @@ describe('crypto provider events, confirmation, and reconciliation', () => {
     expect(await repository.findEvent('fake', 'rollback-event', pool)).toBeNull()
   })
 
-  it('enforces transition and financial-instruction coupling in PostgreSQL', async () => {
+  it('enforces transition and funding-attestation coupling in PostgreSQL', async () => {
     const intent = await createIntent(await createPlayer(), 'database-guards')
     await expect(pool.query(
       `UPDATE crypto_funding_intents

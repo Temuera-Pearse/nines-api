@@ -6,6 +6,8 @@ import { closeDatabasePool, createDatabasePool } from './shared/db/pool.js'
 import { createLogger } from './shared/observability/logger.js'
 import { createKycExpiryWorker } from './kyc/application/KycExpiryWorker.js'
 import { createCryptoFundingExpiryWorker } from './crypto/application/CryptoFundingExpiryWorker.js'
+import { FundingAttestationDeliveryWorker } from './crypto/application/FundingAttestationDeliveryWorker.js'
+import { SecurityEvidenceDeliveryWorker } from './shared/outbox/SecurityEvidenceDeliveryWorker.js'
 
 const SHUTDOWN_TIMEOUT_MS = 10_000
 
@@ -24,6 +26,14 @@ async function main(): Promise<void> {
   let server: Server | null = null
   const expiryWorker = createKycExpiryWorker(pool, logger)
   const cryptoExpiryWorker = createCryptoFundingExpiryWorker(pool, logger)
+  const fundingDeliveryWorker = config.serviceDelivery.fundingAttestationsEnabled
+    ? new FundingAttestationDeliveryWorker(pool, config.serviceDelivery.financialBaseUrl!,
+      config.environment, config.serviceDelivery.hmacSecret!, config.serviceDelivery.keyId,
+      logger, config.serviceDelivery.pollIntervalMs) : null
+  const securityEvidenceWorker = config.serviceDelivery.securityEvidenceEnabled
+    ? new SecurityEvidenceDeliveryWorker(pool, config.serviceDelivery.securityBaseUrl!,
+      config.environment, config.serviceDelivery.hmacSecret!, config.serviceDelivery.keyId,
+      logger, config.serviceDelivery.pollIntervalMs) : null
 
   try {
     await checkDatabaseHealth(pool)
@@ -36,6 +46,8 @@ async function main(): Promise<void> {
     logger.info({ event: 'service_started', port: config.port, environment: config.environment })
     expiryWorker.start()
     cryptoExpiryWorker.start()
+    fundingDeliveryWorker?.start()
+    securityEvidenceWorker?.start()
 
     let shuttingDown = false
     const shutdown = async (signal: string): Promise<void> => {
@@ -53,6 +65,8 @@ async function main(): Promise<void> {
             if (server) await closeHttpServer(server)
             await expiryWorker.stop()
             await cryptoExpiryWorker.stop()
+            await fundingDeliveryWorker?.stop()
+            await securityEvidenceWorker?.stop()
             await closeDatabasePool(pool)
           })(),
           timeout,
@@ -70,6 +84,8 @@ async function main(): Promise<void> {
   } catch (error) {
     await expiryWorker.stop().catch(() => undefined)
     await cryptoExpiryWorker.stop().catch(() => undefined)
+    await fundingDeliveryWorker?.stop().catch(() => undefined)
+    await securityEvidenceWorker?.stop().catch(() => undefined)
     await closeDatabasePool(pool).catch(() => undefined)
     throw error
   }

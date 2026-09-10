@@ -55,6 +55,9 @@ export interface CryptoFundingIntent {
   provider: string
   idempotencyKey: string
   requestHash: string
+  eligibilityDecisionId: string | null
+  eligibilityPolicyVersion: string | null
+  eligibilityEvaluatedAt: Date | null
   providerReference: string | null
   paymentUrl: string | null
   expiresAt: Date

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Pool } from 'pg'
 import type { AuditRepository } from '../../audit/AuditRepository.js'
 import type { EvaluateEligibilityService } from '../../eligibility/application/EvaluateEligibilityService.js'
+import type { EligibilityDecision } from '../../eligibility/domain/EligibilityDecision.js'
 import type { PlayerRepository } from '../../players/infrastructure/PlayerRepository.js'
 import { withTransaction } from '../../shared/db/transaction.js'
 import { AppError } from '../../shared/http/AppError.js'
@@ -87,7 +88,7 @@ export class CreateCryptoFundingIntentService {
     if (compareCryptoAmounts(parsed, minimum) < 0) throw new AppError({ status: 400, code: 'CRYPTO_AMOUNT_BELOW_MINIMUM', message: 'Crypto amount is below the minimum' })
     if (compareCryptoAmounts(parsed, maximum) > 0) throw new AppError({ status: 400, code: 'CRYPTO_AMOUNT_ABOVE_MAXIMUM', message: 'Crypto amount is above the maximum' })
     const hash = requestHash(asset, parsed.canonical)
-    const intent = await this.prepare(input.playerId, input.idempotencyKey, asset, parsed.canonical, hash, actor)
+    const intent = await this.prepare(input.playerId, input.idempotencyKey, asset, parsed.canonical, hash, decision, actor)
     if (intent.requestHash !== hash) throw new AppError({ status: 409, code: 'CRYPTO_IDEMPOTENCY_CONFLICT', message: 'Idempotency key was used for different crypto funding parameters' })
     if (intent.status === 'creation_failed') throw this.creationFailure()
     if (intent.status !== 'provider_pending') return toCryptoFundingPublicResult(intent)
@@ -140,7 +141,8 @@ export class CreateCryptoFundingIntentService {
     })
   }
 
-  private async prepare(playerId: string, key: string, asset: string, amount: string, hash: string, actor: CryptoFundingActorContext): Promise<CryptoFundingIntent> {
+  private async prepare(playerId: string, key: string, asset: string, amount: string, hash: string,
+    decision: EligibilityDecision, actor: CryptoFundingActorContext): Promise<CryptoFundingIntent> {
     const now = this.clock()
     return withTransaction(this.pool, async (client) => {
       const existing = await this.repository.findByPlayerIdempotencyKey(playerId, key, client)
@@ -148,7 +150,10 @@ export class CreateCryptoFundingIntentService {
       const intent = await this.repository.createIntent({
         id: randomUUID(), providerSessionId: randomUUID(), playerId, asset,
         requestedAmount: amount, provider: this.provider!.providerName, idempotencyKey: key,
-        requestHash: hash, expiresAt: new Date(now.getTime() + this.intentTtlMs), createdAt: now,
+        requestHash: hash, eligibilityDecisionId: decision.decisionId,
+        eligibilityPolicyVersion: decision.policyVersion,
+        eligibilityEvaluatedAt: decision.evaluatedAt,
+        expiresAt: new Date(now.getTime() + this.intentTtlMs), createdAt: now,
       }, client)
       if (!intent) {
         const raced = await this.repository.findByPlayerIdempotencyKey(playerId, key, client)
